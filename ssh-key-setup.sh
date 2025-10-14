@@ -1,30 +1,71 @@
 #!/bin/bash
-exec </dev/tty
+set -euo pipefail
 
 echo "🔐 SSH Key Setup Wizard"
+echo
 
+# Input username (default root)
 read -rp "👤 Enter username [default: root]: " user
 user=${user:-root}
-
 if [ "$user" = "root" ]; then
   home_dir="/root"
 else
   home_dir="/home/$user"
 fi
 
-read -rp "📋 Paste your SSH public key: " ssh_key
+# Input SSH public key (allow multi-line paste)
+echo "📋 Paste your SSH public key and press Enter (Ctrl+D when done):"
+ssh_key=""
+while IFS= read -r line; do
+  ssh_key+="${line}"$'\n'
+done
 
+# Validate non-empty key
+if [ -z "$ssh_key" ]; then
+  echo "❌ No key provided, aborting."
+  exit 1
+fi
+
+# Setup authorized_keys
 mkdir -p "$home_dir/.ssh"
-echo "$ssh_key" >> "$home_dir/.ssh/authorized_keys"
+echo "$ssh_key" > "$home_dir/.ssh/authorized_keys"
 chmod 700 "$home_dir/.ssh"
 chmod 600 "$home_dir/.ssh/authorized_keys"
 chown -R "$user:$user" "$home_dir/.ssh"
+echo "✅ SSH key added for $user at $home_dir/.ssh/authorized_keys"
+echo
 
+# Option to disable password authentication
 read -rp "🚫 Disable password login for SSH? (y/n): " disable_pwd
 if [[ "$disable_pwd" =~ ^[Yy]$ ]]; then
-  sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-  systemctl restart sshd
-  echo "✅ Password login disabled."
+  echo "🔧 Backing up /etc/ssh/sshd_config..."
+  cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.$(date +%s)
+
+  # Edit or append directive
+  if grep -q "^#\?PasswordAuthentication" /etc/ssh/sshd_config; then
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+  else
+    echo "PasswordAuthentication no" >> /etc/ssh/sshd_config
+  fi
+
+  # Also disable ChallengeResponseAuthentication just in case
+  if grep -q "^#\?ChallengeResponseAuthentication" /etc/ssh/sshd_config; then
+    sed -i 's/^#\?ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
+  else
+    echo "ChallengeResponseAuthentication no" >> /etc/ssh/sshd_config
+  fi
+
+  echo "🧪 Testing SSH config..."
+  if sshd -t; then
+    echo "✅ Config OK, restarting SSH..."
+    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || service ssh restart 2>/dev/null
+    echo "🔒 Password login disabled."
+  else
+    echo "❌ SSH config test failed! Reverting backup..."
+    cp /etc/ssh/sshd_config.bak.* /etc/ssh/sshd_config
+  fi
 fi
 
+echo
 echo "🎉 SSH setup complete for user '$user'."
+echo "Try logging in using your private key now."
