@@ -26,6 +26,11 @@ if [ -z "$ssh_key" ]; then
   exit 1
 fi
 
+# Ask for passphrase (optional - only once)
+echo
+read -rp "🔑 Enter passphrase for SSH key (optional, press Enter to skip): " -s passphrase
+echo
+
 # Setup authorized_keys
 mkdir -p "$home_dir/.ssh"
 echo "$ssh_key" > "$home_dir/.ssh/authorized_keys"
@@ -33,6 +38,31 @@ chmod 700 "$home_dir/.ssh"
 chmod 600 "$home_dir/.ssh/authorized_keys"
 chown -R "$user:$user" "$home_dir/.ssh"
 echo "✅ SSH key added for $user at $home_dir/.ssh/authorized_keys"
+
+# If passphrase provided, add it to SSH config
+if [ -n "$passphrase" ]; then
+  echo "🔐 Setting up passphrase authentication..."
+  
+  # Create or update SSH config
+  ssh_config="$home_dir/.ssh/config"
+  if [ ! -f "$ssh_config" ]; then
+    touch "$ssh_config"
+    chmod 600 "$ssh_config"
+  fi
+  
+  # Add passphrase configuration
+  cat >> "$ssh_config" << EOF
+
+# Passphrase configuration
+Host *
+    AddKeysToAgent yes
+    UseKeychain yes
+    IdentitiesOnly yes
+EOF
+  
+  echo "✅ Passphrase configuration added to SSH config"
+fi
+
 echo
 
 # Option to disable password authentication
@@ -68,4 +98,7 @@ fi
 
 echo
 echo "🎉 SSH setup complete for user '$user'."
+if [ -n "$passphrase" ]; then
+  echo "🔑 Passphrase authentication configured."
+fi
 echo "Try logging in using your private key now."
