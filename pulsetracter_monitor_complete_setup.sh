@@ -54,6 +54,9 @@ fi
 
 echo "🧩 Clearing old installation files..."
 rm -rf "$INSTALL_DIR"/*
+mkdir -p "$INSTALL_DIR/utils"
+mkdir -p "$INSTALL_DIR/frontend"
+mkdir -p /var/log/pulsetracker
 sleep 1
 
 # -----------------------------
