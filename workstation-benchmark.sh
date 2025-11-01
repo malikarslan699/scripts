@@ -199,8 +199,14 @@ summaries(){
   local SNET=$(score_map "$NET_RATE"); local SMT=$(score_map "$MULTI_RATE")
   local OVR=$(overall_score "$SCPU" "$SMEM" "$SDISK" "$SNET" "$SMT"); local OLAB=$(overall_label "$OVR")
 
-  local CONN_CNT=0; [[ "$P80" == ok ]] && ((CONN_CNT++)); [[ "$P443" == ok ]] && ((CONN_CNT++)); [[ "$P53A" == ok ]] && ((CONN_CNT++)); [[ "$P53B" == ok ]] && ((CONN_CNT++))
-  local CONN_RATE=$(awk -v c="$CONN_CNT" 'BEGIN{printf("%.0f", (c/4)*100)}')
+  # Connectivity score (safe with set -u)
+  local CONN_CNT=0
+  [[ "${P80:-blocked}"  == "ok" ]] && CONN_CNT=$((CONN_CNT+1))
+  [[ "${P443:-blocked}" == "ok" ]] && CONN_CNT=$((CONN_CNT+1))
+  [[ "${P53A:-blocked}" == "ok" ]] && CONN_CNT=$((CONN_CNT+1))
+  [[ "${P53B:-blocked}" == "ok" ]] && CONN_CNT=$((CONN_CNT+1))
+  local CONN_RATE
+  CONN_RATE=$(awk -v c="$CONN_CNT" 'BEGIN{printf("%.0f", (c/4)*100)}')
 
   # Plain text
   cat > "vps-benchmark-report.txt" <<TXT
