@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # ================================================================
-#  Workstation Analyzer Pro+ (Deep Seek Final Edition)
+#  Workstation Analyzer Final (Deep Seek Edition)
 #  Author: Malik Saqib
-#  Purpose: Complete hardware & performance analysis with Power Score (0–100)
+#  Purpose: Deep, authentic system evaluation with Power Score
 # ================================================================
 
 set -euo pipefail
 IFS=$'\n\t'
 
-echo "================== WORKSTATION ANALYZER PRO+ =================="
+echo "================== WORKSTATION ANALYZER FINAL =================="
 echo "[*] Running Deep Seek full system analysis..."
 echo ""
 
 # --------------------- Dependencies ---------------------
 if ! command -v sysbench &>/dev/null || ! command -v bc &>/dev/null || ! command -v curl &>/dev/null; then
-  echo "[*] Installing base tools..."
+  echo "[*] Installing required tools..."
   apt-get update -qq && apt-get install -y sysbench bc curl jq stress-ng fio >/dev/null 2>&1
 fi
 
@@ -28,6 +28,7 @@ RAM_MB=$(free -m | awk '/Mem:/ {print $2}')
 DISK_TOTAL=$(df -h / | awk 'NR==2 {print $2}')
 UPTIME=$(uptime -p || echo "N/A")
 
+# IP + Geo Info
 IPV4=$(curl -4 -s ifconfig.me || echo "N/A")
 IPV6=$(curl -6 -s ifconfig.me || echo "N/A")
 
@@ -58,11 +59,11 @@ MEM_SPEED=${MEM_SPEED:-0}
 echo "Memory Speed: $MEM_SPEED MiB/sec"
 
 # --------------------- Disk Benchmark ---------------------
-echo "[*] Running Disk Write test (safe mode)..."
+echo "[*] Running Disk Write test (safe mode, non-hanging)..."
 DISK_RESULT=$(timeout 20 dd if=/dev/zero of=/tmp/testfile bs=1M count=512 conv=sync status=none 2>&1 || echo "Disk test timeout")
 DISK_SPEED=$(echo "$DISK_RESULT" | grep -oE '[0-9.]+ MB/s' | tail -1 | awk '{print $1}')
 if [ -z "$DISK_SPEED" ]; then
-  echo "[!] Fallback: using fio for accuracy..."
+  echo "[!] dd fallback failed — using fio..."
   DISK_SPEED=$(timeout 20 fio --name=seqwrite --rw=write --bs=1M --size=512M --numjobs=1 --time_based --runtime=10s --group_reporting 2>/dev/null | grep -oE '[0-9.]+ MB/s' | tail -1)
 fi
 DISK_SPEED=${DISK_SPEED:-0}
@@ -75,10 +76,11 @@ DISK_READ=${DISK_READ:-0}
 echo "Disk Read: $DISK_READ MB/s"
 
 # --------------------- Network Benchmark ---------------------
-echo "[*] Running Network test (multi-mirror)..."
+echo "[*] Running Network test (3 mirrors)..."
 declare -a urls=("http://cachefly.cachefly.net/100mb.test" \
 "http://ipv4.download.thinkbroadband.com/100MB.zip" \
 "https://proof.ovh.net/files/100Mb.dat")
+
 TOTAL_NET=0
 for u in "${urls[@]}"; do
   SPEED=$(curl -s -o /dev/null -w '%{speed_download}' --max-time 25 "$u" | awk '{printf "%.2f", $1/1024/1024}')
@@ -87,11 +89,11 @@ for u in "${urls[@]}"; do
 done
 NET_AVG=$(echo "$TOTAL_NET / ${#urls[@]}" | bc -l)
 NET_AVG=$(printf "%.2f" "$NET_AVG")
-echo "Network Avg: $NET_AVG MB/s"
+echo "Network Average: $NET_AVG MB/s"
 echo ""
 
 # --------------------- Stability Test ---------------------
-echo "[*] Performing system stress test (10s)..."
+echo "[*] Running system stress test (10s)..."
 timeout 10 stress-ng --cpu "$VCPUS" --timeout 10s >/dev/null 2>&1
 LOAD_AVG=$(awk '{print $1}' /proc/loadavg)
 LOAD_RATIO=$(awk -v l="$LOAD_AVG" -v c="$VCPUS" 'BEGIN{printf "%.2f", l/c}')
@@ -101,7 +103,7 @@ else STAB_SCORE=60; fi
 echo "Load Ratio: $LOAD_RATIO | Stability Score: $STAB_SCORE"
 echo ""
 
-# --------------------- Normalized Scoring ---------------------
+# --------------------- Scoring System ---------------------
 norm() {
   local val=$1 max=$2
   echo "$(awk -v v="$val" -v m="$max" 'BEGIN{if(v>=m)print 100;else print (v/m*100)}')"
@@ -120,7 +122,7 @@ elif (( $(echo "$POWER_SCORE >= 70" | bc -l) )); then VERDICT="🟢 Strong — D
 elif (( $(echo "$POWER_SCORE >= 55" | bc -l) )); then VERDICT="🟡 Moderate — Light workloads"
 else VERDICT="🔴 Weak — Not Recommended"; fi
 
-# --------------------- Final Report ---------------------
+# --------------------- Final Summary ---------------------
 echo "=================== FINAL SYSTEM ANALYSIS ==================="
 printf "%-25s %s\n" "CPU Performance:" "$CPU_SCORE events/sec (Score: ${CPU_N%.*}/100)"
 printf "%-25s %s\n" "Memory Throughput:" "$MEM_SPEED MiB/s (Score: ${MEM_N%.*}/100)"
