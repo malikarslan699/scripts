@@ -129,7 +129,6 @@ to_number() {
   echo "$1" | awk '{gsub(/[^0-9.]/,""); if($0=="") print "0"; else print $0}'
 }
 
-########## Collect System Info ##########
 echo "[*] Collecting system info..."
 OS_INFO="$(try_cmd lsb_release -ds || try_cmd cat /etc/os-release || echo "unknown")"
 KERNEL="$(uname -r || echo "unknown")"
@@ -138,7 +137,7 @@ CPU_MODEL="$(try_cmd lscpu | awk -F: '/Model name|Model/ {print $2; exit}' || ec
 CPU_COUNT="$(try_cmd nproc || echo "0")"
 RAM_MB="$(free -m | awk '/Mem:/ {print $2}' 2>/dev/null || echo "0")"
 DISK_TOTAL_KB="$(df --output=size -k / | sed -n 2p 2>/dev/null || echo "0")"
-DISK_TOTAL_MB="$(awk "BEGIN{printf \"%.0f\", $DISK_TOTAL_KB/1024}")"
+DISK_TOTAL_MB="$(awk "BEGIN { printf \"%.0f\", ${DISK_TOTAL_KB}/1024 }")"
 UPTIME_STR="$(uptime -p || echo "unknown")"
 PUBLIC_IP="$(try_cmd curl -s --max-time 5 ifconfig.me || try_cmd curl -s --max-time 5 ipinfo.io/ip || echo "unknown")"
 
