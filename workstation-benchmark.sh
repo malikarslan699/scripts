@@ -2,8 +2,12 @@
 set -Eeuo pipefail
 trap 'echo "[ERROR] line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
+VERSION="1.1.0"
+RAW_URL="https://raw.githubusercontent.com/malikarslan699/scripts/main/workstation-benchmark.sh"
+
 AUTO_YES=false
 QUICK=false
+DO_SELF_UPDATE=false
 
 # ---------- UI ----------
 ok(){ echo -e "\033[1;32m[OK]\033[0m $*"; }
@@ -24,17 +28,40 @@ parse_args(){
     case "$a" in
       -y|--yes) AUTO_YES=true;;
       --quick) QUICK=true;;
+      --self-update|--update) DO_SELF_UPDATE=true;;
       -h|--help)
         cat <<H
-Usage: sudo ./workstation-benchmark.sh [--yes] [--quick]
+Usage: sudo ./workstation-benchmark.sh [--yes] [--quick] [--self-update]
 - Default: single-run accurate (3 rounds/median per metric)
 - --quick: 1 round, smaller payload (fast screen)
+- --self-update: fetch latest script from GitHub into current executable path
 Creates: vps-benchmark-report.txt, vps-report-<hostname>.md, vps-report-<hostname>.json
 H
         exit 0;;
       *) warn "Unknown option: $a";;
     esac
   done
+}
+
+self_update(){
+  local self="${0}"
+  # If running via symlink/absolute path, resolve; ignore if piped (bash -s)
+  if [[ "$self" == "bash" || "$self" == "-bash" || "$self" == "sh" || "$self" == "-sh" || "$self" == "/dev/fd/"* ]]; then
+    warn "Self-update skipped (script is piped). Install to /usr/local/bin to use --self-update."
+    return 0
+  fi
+  local path
+  path="$(readlink -f "$self" 2>/dev/null || echo "$self")"
+  if [[ ! -w "$path" ]]; then
+    warn "Self-update: no write permission on $path"
+    return 0
+  fi
+  info "Self-updating '$path' from: $RAW_URL"
+  curl -fsSL "$RAW_URL" -o "${path}.tmp"
+  chmod +x "${path}.tmp"
+  mv "${path}.tmp" "$path"
+  ok "Updated. VERSION=$VERSION (file replaced)."
+  exit 0
 }
 
 # ---------- Packages (Ubuntu/Debian) ----------
@@ -82,6 +109,21 @@ load_ratio(){ local l=$(awk '{print $1}' /proc/loadavg); local v=$(nproc); awk -
 # ---------- Ports ----------
 tcp_check(){ local h=$1 p=$2; timeout 2 bash -c "</dev/tcp/$h/$p" >/dev/null 2>&1 && echo ok || echo blocked; }
 
+# ---------- Choose disk-backed temp dir (avoid tmpfs) ----------
+choose_io_dir(){
+  # Prefer /var/tmp; fallback to /root; ensure not tmpfs
+  local cand dir
+  for cand in /var/tmp /root; do
+    if [[ -d "$cand" && -w "$cand" ]]; then
+      local fs; fs=$(findmnt -no FSTYPE "$cand" 2>/dev/null || echo "")
+      if [[ "$fs" != "tmpfs" && "$fs" != "ramfs" ]]; then
+        dir="$cand"; break
+      fi
+    fi
+  done
+  echo "${dir:-/var/tmp}"
+}
+
 # ---------- HTTP mirrors ----------
 http_round(){ local url=$1 max_time=$2 range=$3; curl --max-time "$max_time" -L $range -o /dev/null -s -w "%{speed_download}\n" "$url" 2>/dev/null || echo 0; }
 http_suite(){
@@ -107,10 +149,19 @@ cpu_suite(){ local secs=10; $QUICK && secs=3; local Rounds=3; $QUICK && Rounds=1
 mem_suite(){ local total=2G; $QUICK && total=256M; local Rounds=3; $QUICK && Rounds=1; : > /tmp/_mem_rate.txt
   for _ in $(seq 1 $Rounds); do sysbench memory --memory-total-size="$total" --memory-block-size=1M --threads=$(nproc) run | awk '{if ($0 ~ /MiB transferred/){ if (match($0, /\(([0-9.]+) MiB\/sec\)/, m)) print m[1]; }}' >> /tmp/_mem_rate.txt; done
   awk '{print $1}' /tmp/_mem_rate.txt | median_stdin; }
-disk_suite(){ local MiB=1024; $QUICK && MiB=256; local Rounds=3; $QUICK && Rounds=1; : > /tmp/_disk_rate.txt
-  for _ in $(seq 1 $Rounds); do sync; dd if=/dev/zero of=/tmp/io.test bs=1M count="$MiB" oflag=direct status=none 2> /tmp/_dd.tmp || true; sync
-    awk -F, '/copied/ {gsub(/^ +/,"",$3); print $3}' /tmp/_dd.tmp | awk '{print $1}' >> /tmp/_disk_rate.txt; rm -f /tmp/io.test >/dev/null 2>&1 || true; done
-  awk '{print $1}' /tmp/_disk_rate.txt | median_stdin; }
+disk_suite(){
+  local MiB=1024; $QUICK && MiB=256
+  local Rounds=3; $QUICK && Rounds=1
+  local ddir; ddir=$(choose_io_dir)
+  : > /tmp/_disk_rate.txt
+  for _ in $(seq 1 $Rounds); do
+    local of="$ddir/io.test"
+    sync; dd if=/dev/zero of="$of" bs=1M count="$MiB" oflag=direct status=none 2> /tmp/_dd.tmp || true; sync
+    awk -F, '/copied/ {gsub(/^ +/,"",$3); print $3}' /tmp/_dd.tmp | awk '{print $1}' >> /tmp/_disk_rate.txt
+    rm -f "$of" >/dev/null 2>&1 || true
+  done
+  awk '{print $1}' /tmp/_disk_rate.txt | median_stdin;
+}
 
 # ---------- Ratings ----------
 rate_cpu(){ local v=$1; if (( $(printf '%.0f' "$v") > 8000 )); then echo Excellent; elif (( $(printf '%.0f' "$v") >= 5000 )); then echo Good; elif (( $(printf '%.0f' "$v") >= 2500 )); then echo Fair; else echo Poor; fi; }
@@ -229,13 +280,13 @@ MD
       overall:{label:$overall,score:($overall_score|tonumber)}}' > "vps-report-${HN}.json"
 
   ok "Reports written: vps-benchmark-report.txt, vps-report-${HN}.md, vps-report-${HN}.json"
-  # Auto-print the plain-text report
   echo
   cat vps-benchmark-report.txt
 }
 
 main(){
   parse_args "$@"
+  $DO_SELF_UPDATE && self_update
   ask "Run standardized VPS benchmark now?" || { warn "Aborted"; exit 0; }
   ask "This installs curl/jq/sysbench/iproute2. Proceed?" || { warn "Aborted"; exit 0; }
   ensure_tools
@@ -261,8 +312,8 @@ main(){
 
   http_suite $QUICK
   HTTP_SUMMARY=$(cat /tmp/_http_summary.txt)
-  MEDS=$(awk -F'median=' '{if(NF>1){split($2,a,"MB/s"); gsub(/ /,"",a[1]); print a[1]}}' /tmp/_http_summary.txt | awk '$1>0')
-  if [[ -n "${MEDS}" ]]; then
+  MEDS=$(awk -F'median=' '{if(NF>1){split($2,a,"MB/s"); gsub(/ /,"",a[1]); print a[1]}}' /tmp/_http_summary.txt | awk '$1>0' || true)
+  if [[ -n "${MEDS:-}" ]]; then
     NET_MED=$(printf "%s\n" $MEDS | median_stdin)
     NET_BEST=$(printf "%s\n" $MEDS | max_stdin)
   else
@@ -279,5 +330,4 @@ main(){
             "$CPU_MED" "$MEM_MED" "$DISK_MED" "$LOADR" \
             "$HTTP_SUMMARY" "$NET_MED" "$NET_BEST" "$P80" "$P443" "$P53A" "$P53B"
 }
-
 main "$@"
