@@ -4,14 +4,13 @@ trap 'echo "[ERROR] Command failed at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
 AUTO_YES=false
 QUICK=false
-WITH_OOKLA=false      # set true to try Ookla; defaults to off (can hang on some VPS)
-WITH_IPERF=false      # set true to try iperf3; defaults to off (can hang on some VPS)
+WITH_OOKLA=false      # try Ookla (may hang if provider blocks)
+WITH_IPERF=false      # try iperf3 (may hang if provider blocks)
 
 GREEN="\033[1;32m"; YELLOW="\033[1;33m"; RED="\033[1;31m"; BLUE="\033[1;34m"; RESET="\033[0m"
 ok(){ echo -e "${GREEN}[OK]${RESET} $*"; }
 warn(){ echo -e "${YELLOW}[WARN]${RESET} $*"; }
 info(){ echo -e "${BLUE}[INFO]${RESET} $*"; }
-fail(){ echo -e "${RED}[FAIL]${RESET} $*"; }
 
 ask(){
   local m=${1:-Proceed?}
@@ -60,14 +59,8 @@ ensure_tools(){
 }
 
 # Helpers
-fmt_mb_gb(){ # input MB -> "X MB" or "Y.Y GB"
-  local mb; mb=$(printf '%.2f' "${1:-0}" 2>/dev/null || echo 0)
-  awk -v mb="$mb" 'BEGIN{ if (mb<1024) printf("%.0f MB", mb); else printf("%.1f GB", mb/1024.0) }'
-}
-fmt_bytes_speed(){ # bytes/sec -> "X.Y MB/s (Z.Z Gbps)"
-  local bps; bps=${1:-0}
-  awk -v bps="$bps" 'BEGIN{ mbps=bps/1000000.0; gbps=(bps*8)/1e9; printf("%.1f MB/s (%.2f Gbps)", mbps, gbps) }'
-}
+fmt_mb_gb(){ local mb; mb=$(printf '%.2f' "${1:-0}" 2>/dev/null || echo 0); awk -v mb="$mb" 'BEGIN{ if (mb<1024) printf("%.0f MB", mb); else printf("%.1f GB", mb/1024.0) }'; }
+fmt_bytes_speed(){ local bps=${1:-0}; awk -v bps="$bps" 'BEGIN{ mbps=bps/1000000.0; gbps=(bps*8)/1e9; printf("%.1f MB/s (%.2f Gbps)", mbps, gbps) }'; }
 get_cpu_model(){ lscpu | awk -F: '/Model name/{gsub(/^ +/,"",$2); print $2; exit}'; }
 get_mem_mb(){ free -m | awk '/Mem:/{print $2" "$7}'; }
 get_disk_root_bytes(){ df -B1 / | awk 'NR==2{print $2" "$4}'; }
@@ -114,7 +107,6 @@ run_cpu_bench(){ local t=${1:-10}; info "CPU bench (sysbench ${t}s, all cores)";
 run_mem_bench(){ local total=${1:-2G}; info "Memory bench (sysbench ${total})"; sysbench memory --memory-total-size="$total" --memory-block-size=1M --threads=$(nproc) run > /tmp/_mem.txt || true; }
 run_disk_test(){ local mib=${1:-1024}; info "Disk write (dd ${mib} MiB, direct I/O)"; : > /tmp/_disk.txt; sync; dd if=/dev/zero of=/tmp/io.test bs=1M count="$mib" oflag=direct status=none 2> /tmp/_disk.txt || true; sync; rm -f /tmp/io.test || true; }
 
-# Outbound port checks (TCP) and listening ports
 tcp_check(){ local host=$1 port=$2; timeout 2 bash -c "</dev/tcp/${host}/${port}" >/dev/null 2>&1 && echo "ok" || echo "blocked"; }
 ports_report(){
   echo "Outbound ports:"
@@ -132,37 +124,31 @@ print_summary(){
   echo "OS: $(. /etc/os-release; echo "$PRETTY_NAME")  Kernel: $(uname -r)"
   echo "CPU: $(get_cpu_model)  vCPU: $(nproc)"
 
-  # Memory
   read -r mem_total_mb mem_avail_mb < <(get_mem_mb)
   echo "RAM: $(fmt_mb_gb "$mem_total_mb") total, $(fmt_mb_gb "$mem_avail_mb") available"
 
-  # Disk (/)
   read -r disk_total_b disk_free_b < <(get_disk_root_bytes)
   disk_total_mb=$(awk -v b=$disk_total_b 'BEGIN{print b/1048576}')
   disk_free_mb=$(awk -v b=$disk_free_b 'BEGIN{print b/1048576}')
   echo "Disk (/): $(fmt_mb_gb "$disk_total_mb") total, $(fmt_mb_gb "$disk_free_mb") free"
 
-  # CPU perf
   cpu_eps=""
   if [[ -s /tmp/_cpu.txt ]]; then
     cpu_eps=$(awk -F: '/events per second/ {gsub(/^[ \t]+/, "", $2); print $2}' /tmp/_cpu.txt | tail -n1)
     [[ -n "${cpu_eps:-}" ]] && echo "CPU perf: ${cpu_eps} events/sec (sysbench)" || echo "CPU perf: n/a"
   fi
 
-  # Memory throughput
   mem_rate=""
   if [[ -s /tmp/_mem.txt ]]; then
     mem_rate=$(awk '{if ($0 ~ /MiB transferred/){ if (match($0, /\(([0-9.]+) MiB\/sec\)/, m)) print m[1]; }}' /tmp/_mem.txt | tail -n1)
     [[ -n "${mem_rate:-}" ]] && echo "Memory throughput: ${mem_rate} MiB/sec (sysbench)" || echo "Memory throughput: n/a"
   fi
 
-  # Disk throughput
   if [[ -s /tmp/_disk.txt ]]; then
     disk_rate=$(awk -F, '/copied/ {gsub(/^ +/,"", $3); print $3}' /tmp/_disk.txt | awk '{print $1" "$2}' | tail -n1)
     [[ -n "${disk_rate:-}" ]] && echo "Disk write: ${disk_rate} (dd oflag=direct)" || echo "Disk write: n/a"
   fi
 
-  # HTTP mirrors speeds
   net_mb_s_median=""; net_mb_s_best=""
   if [[ -s /tmp/_http.txt ]]; then
     echo "HTTP mirrors:"
@@ -185,7 +171,6 @@ print_summary(){
     fi
   fi
 
-  # Optional Ookla
   if [[ -s /tmp/_ookla.json ]]; then
     d_bw=$(jq -r '.download.bandwidth' /tmp/_ookla.json 2>/dev/null || echo 0)
     u_bw=$(jq -r '.upload.bandwidth' /tmp/_ookla.json 2>/dev/null || echo 0)
@@ -196,7 +181,6 @@ print_summary(){
   echo "Ports:"
   ports_report
 
-  # Multitasking rating
   rating="Basic"
   vcpu=$(nproc || echo 1)
   eps_num=$(printf '%.0f' "${cpu_eps:-0}" 2>/dev/null || echo 0)
@@ -206,7 +190,6 @@ print_summary(){
   else rating="Basic"; fi
   echo "Multitasking (est.): ${rating}"
 
-  # Network suitability (from HTTP mirrors): median >=10 MB/s and best >=20 MB/s
   net_ok="unknown"; reason=""
   if [[ -n "${net_mb_s_median:-}" ]]; then
     awk -v med="$net_mb_s_median" -v best="$net_mb_s_best" 'BEGIN{ok=(med>=10 && best>=20); print ok?"yes":"no"}' | read -r net_ok
