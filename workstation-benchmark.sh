@@ -67,7 +67,7 @@ min_stdin(){ sort -n | head -n1; }
 max_stdin(){ sort -n | tail -n1; }
 
 get_hostname(){ hostname; }
-get_public_ip(){ curl -fsS ifconfig.me || echo "unknown"; }
+get_public_ip(){ curl -4 -fsS ifconfig.me || curl -4 -fsS https://api.ipify.org || echo "unknown"; }
 get_geo(){ curl -fsS https://ipinfo.io 2>/dev/null | jq -r '"\(.city // "?"), \(.region // "?"), \(.country // "?")"' | sed 's/^null.*$/unknown/'; }
 get_virt(){ (systemd-detect-virt 2>/dev/null || echo unknown); }
 get_os(){ . /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}"; }
