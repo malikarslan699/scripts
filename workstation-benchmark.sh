@@ -229,6 +229,9 @@ MD
       overall:{label:$overall,score:($overall_score|tonumber)}}' > "vps-report-${HN}.json"
 
   ok "Reports written: vps-benchmark-report.txt, vps-report-${HN}.md, vps-report-${HN}.json"
+  # Auto-print the plain-text report
+  echo
+  cat vps-benchmark-report.txt
 }
 
 main(){
