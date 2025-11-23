@@ -23,17 +23,34 @@ backup_config() {
 }
 
 get_sshd_service_name() {
-  local svc
-  for svc in sshd ssh; do
-    if command -v systemctl >/dev/null 2>&1; then
-      if systemctl list-unit-files 2>/dev/null | grep -q "^$svc.service"; then
-        echo "$svc"
-        return 0
-      fi
+  # Prefer systemctl if available
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl status sshd >/dev/null 2>&1; then
+      echo "sshd"
+      return 0
     fi
-  done
+    if systemctl status ssh >/dev/null 2>&1; then
+      echo "ssh"
+      return 0
+    fi
+  fi
+
+  # Fallback to legacy "service" command
+  if command -v service >/dev/null 2>&1; then
+    if service sshd status >/dev/null 2>&1; then
+      echo "sshd"
+      return 0
+    fi
+    if service ssh status >/dev/null 2>&1; then
+      echo "ssh"
+      return 0
+    fi
+  fi
+
+  # Last resort: assume sshd
   echo "sshd"
 }
+
 
 SSHD_SERVICE="$(get_sshd_service_name)"
 
