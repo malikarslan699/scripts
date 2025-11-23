@@ -307,15 +307,17 @@ harden_sshd_menu() {
   echo "PasswordAuthentication setting for NON-root users:"
   echo "  y = yes  (password login allowed, root still key-only)"
   echo "  n = no   (no passwords at all, only SSH keys)"
-  read -rp "Keep PasswordAuthentication yes? (y/N): " pw_ans
-  pw_ans=${pw_ans:-N}
 
-  local password_auth
-  if [[ "$pw_ans" =~ ^[Yy]$ ]]; then
-    password_auth="yes"
-  else
-    password_auth="no"
-  fi
+read -rp "Keep PasswordAuthentication yes? (y/N): " pw_ans
+pw_ans=${pw_ans:-N}
+
+# Accept: y, Y, yes, Yes, YES
+if [[ "$pw_ans" =~ ^[Yy](es)?$ ]]; then
+  password_auth="yes"
+else
+  password_auth="no"
+fi
+
 
   backup_config
   write_minimal_config "$port" "$password_auth"
