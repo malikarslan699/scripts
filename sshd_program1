@@ -1,0 +1,440 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SSHD_CONFIG="/etc/ssh/sshd_config"
+BACKUP_DIR="/etc/ssh/sshd_config.backups"
+
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "[ERROR] Please run this script as root (sudo ./sshd_program)." >&2
+    exit 1
+  fi
+}
+
+backup_config() {
+  mkdir -p "$BACKUP_DIR"
+  local ts
+  ts="$(date +%F-%H%M%S)"
+  local backup="$BACKUP_DIR/sshd_config.$ts"
+
+  cp "$SSHD_CONFIG" "$backup"
+  echo "[INFO] Existing sshd_config backed up to: $backup"
+}
+
+get_sshd_service_name() {
+  # Prefer systemctl if available
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl status sshd >/dev/null 2>&1; then
+      echo "sshd"
+      return 0
+    fi
+    if systemctl status ssh >/dev/null 2>&1; then
+      echo "ssh"
+      return 0
+    fi
+  fi
+
+  # Fallback to legacy "service" command
+  if command -v service >/dev/null 2>&1; then
+    if service sshd status >/dev/null 2>&1; then
+      echo "sshd"
+      return 0
+    fi
+    if service ssh status >/dev/null 2>&1; then
+      echo "ssh"
+      return 0
+    fi
+  fi
+
+  # Last resort: assume sshd
+  echo "sshd"
+}
+
+SSHD_SERVICE="$(get_sshd_service_name)"
+
+check_sshd_config() {
+  if command -v sshd >/dev/null 2>&1; then
+    if sshd -t 2>/tmp/sshd_test_err; then
+      echo "[OK] sshd config syntax test successful."
+      rm -f /tmp/sshd_test_err
+      return 0
+    else
+      echo "[ERROR] sshd config syntax test failed:" >&2
+      cat /tmp/sshd_test_err >&2 || true
+      rm -f /tmp/sshd_test_err
+      return 1
+    fi
+  else
+    echo "[WARN] sshd binary not found, skipping config test." >&2
+    return 0
+  fi
+}
+
+restart_sshd() {
+  echo "[INFO] Restarting sshd service ($SSHD_SERVICE)..."
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl restart "$SSHD_SERVICE" 2>/tmp/sshd_restart_err; then
+      echo "[OK] sshd service restarted."
+      rm -f /tmp/sshd_restart_err
+    else
+      echo "[ERROR] Failed to restart sshd:" >&2
+      cat /tmp/sshd_restart_err >&2 || true
+      rm -f /tmp/sshd_restart_err
+    fi
+  else
+    if service "$SSHD_SERVICE" restart 2>/tmp/sshd_restart_err; then
+      echo "[OK] sshd service restarted."
+      rm -f /tmp/sshd_restart_err
+    else
+      echo "[ERROR] Failed to restart sshd:" >&2
+      cat /tmp/sshd_restart_err >&2 || true
+      rm -f /tmp/sshd_restart_err
+    fi
+  fi
+}
+
+status_sshd_service() {
+  echo "[INFO] sshd service status ($SSHD_SERVICE):"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl status "$SSHD_SERVICE"
+  else
+    service "$SSHD_SERVICE" status
+  fi
+}
+
+get_allow_users_line() {
+  if [[ -f "$SSHD_CONFIG" ]]; then
+    grep -E '^[[:space:]]*AllowUsers\b' "$SSHD_CONFIG" 2>/dev/null || true
+  fi
+}
+
+get_conf_value() {
+  # get_conf_value "Key" "default_value"
+  local key="$1"
+  local default="${2:-"(not set)"}"
+  if [[ -f "$SSHD_CONFIG" ]]; then
+    local line
+    line=$(grep -E "^[[:space:]]*$key[[:space:]]+" "$SSHD_CONFIG" | tail -n1 || true)
+    if [[ -n "$line" ]]; then
+      echo "$line" | awk '{print $2}'
+      return 0
+    fi
+  fi
+  echo "$default"
+}
+
+show_config_summary() {
+  echo "---------- SSHD CONFIG SUMMARY ----------"
+  echo "Config file: $SSHD_CONFIG"
+  echo
+
+  local port
+  port=$(get_conf_value "Port" "22 (default)")
+  echo "SSH Port:                     $port"
+
+  local permit_root
+  permit_root=$(get_conf_value "PermitRootLogin" "prohibit-password (default on many distros)")
+  echo "Root login (PermitRootLogin): $permit_root"
+
+  local passwd_auth
+  passwd_auth=$(get_conf_value "PasswordAuthentication" "(not set - usually 'yes' by default)")
+  echo "PasswordAuthentication:       $passwd_auth"
+
+  local kbd
+  kbd=$(get_conf_value "KbdInteractiveAuthentication" "(not set)")
+  echo "KbdInteractiveAuthentication: $kbd"
+
+  local pubkey
+  pubkey=$(get_conf_value "PubkeyAuthentication" "(not set - default is 'yes')")
+  echo "PubkeyAuthentication:         $pubkey"
+
+  local usepam
+  usepam=$(get_conf_value "UsePAM" "(not set - usually 'yes')")
+  echo "UsePAM:                       $usepam"
+
+  local allow_line
+  allow_line=$(grep -E "^[[:space:]]*AllowUsers[[:space:]]+" "$SSHD_CONFIG" | tail -n1 || true)
+  if [[ -n "$allow_line" ]]; then
+    echo "AllowUsers:                   $(echo "$allow_line" | cut -d' ' -f2-)"
+  else
+    echo "AllowUsers:                   (NOT set - any local user can SSH if other checks allow)"
+  fi
+
+  local login_grace
+  login_grace=$(get_conf_value "LoginGraceTime" "(not set - default 2m)")
+  echo "LoginGraceTime:               $login_grace"
+
+  local max_auth
+  max_auth=$(get_conf_value "MaxAuthTries" "(not set - default 6)")
+  echo "MaxAuthTries:                 $max_auth"
+
+  local max_sess
+  max_sess=$(get_conf_value "MaxSessions" "(not set - default 10)")
+  echo "MaxSessions:                  $max_sess"
+
+  local x11
+  x11=$(get_conf_value "X11Forwarding" "(not set - default 'yes')")
+  echo "X11Forwarding:                $x11"
+
+  local tcp_fwd
+  tcp_fwd=$(get_conf_value "AllowTcpForwarding" "(not set - default 'yes')")
+  echo "AllowTcpForwarding:           $tcp_fwd"
+
+  local cai
+  cai=$(get_conf_value "ClientAliveInterval" "(not set - default 0)")
+  echo "ClientAliveInterval:          $cai"
+
+  local cac
+  cac=$(get_conf_value "ClientAliveCountMax" "(not set - default 3)")
+  echo "ClientAliveCountMax:          $cac"
+
+  echo
+  echo "[INFO] Running sshd config syntax test..."
+  if check_sshd_config; then
+    echo "[INFO] sshd configuration looks valid."
+  else
+    echo "[WARN] sshd configuration has errors (see above)."
+  fi
+  echo "-----------------------------------------"
+}
+
+write_minimal_config() {
+  local port="$1"
+  local password_auth="$2"   # yes/no
+  local allow_users_line
+
+  allow_users_line="$(get_allow_users_line)"
+
+  cat > "$SSHD_CONFIG" <<EOF
+# Managed by sshd_program
+# Minimal, clean sshd_config with only essential options plus basic hardening.
+
+Include /etc/ssh/sshd_config.d/*.conf
+
+Port $port
+Protocol 2
+
+# Root user: no password login (keys only). You can change this from the menu.
+PermitRootLogin prohibit-password
+
+# Global password authentication (for non-root)
+PasswordAuthentication $password_auth
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+
+UsePAM yes
+
+# Brute-force protection (basic)
+LoginGraceTime 30s
+MaxAuthTries 3
+MaxSessions 5
+
+# Only these Linux users are allowed to SSH
+${allow_users_line}
+
+# Security: disable X11 and TCP forwarding by default
+X11Forwarding no
+AllowTcpForwarding no
+
+# Disconnect idle sessions
+ClientAliveInterval 300
+ClientAliveCountMax 2
+
+# Public key authentication
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+
+# Environment and MOTD
+AcceptEnv LANG LC_*
+PrintMotd no
+
+# SFTP subsystem
+Subsystem   sftp    /usr/lib/openssh/sftp-server
+EOF
+
+  echo "[INFO] New minimal sshd_config has been written."
+}
+
+add_user_and_allow() {
+  read -rp "Enter new username (single word, e.g. deploy): " username
+
+  if [[ -z "$username" ]]; then
+    echo "[ERROR] Username cannot be empty."
+    return 1
+  fi
+
+  if id "$username" >/dev/null 2>&1; then
+    echo "[INFO] User '$username' already exists."
+  else
+    echo "[INFO] Creating user '$username'..."
+    useradd -m -s /bin/bash "$username"
+    echo "[INFO] Now set a password for '$username':"
+    passwd "$username"
+
+    read -rp "Give this user sudo/root-like privileges? (y/N): " give_sudo
+    give_sudo=${give_sudo:-N}
+    if [[ "$give_sudo" =~ ^[Yy]$ ]]; then
+      if getent group sudo >/dev/null 2>&1; then
+        usermod -aG sudo "$username"
+        echo "[OK] User '$username' added to 'sudo' group."
+      elif getent group wheel >/dev/null 2>&1; then
+        usermod -aG wheel "$username"
+        echo "[OK] User '$username' added to 'wheel' group."
+      else
+        echo "[WARN] No 'sudo' or 'wheel' group found. You must configure sudoers manually."
+      fi
+    fi
+  fi
+
+  backup_config
+
+  if grep -qE '^[[:space:]]*AllowUsers\b' "$SSHD_CONFIG"; then
+    if grep -qE "^[[:space:]]*AllowUsers.*[[:space:]]$username([[:space:]]|\$)" "$SSHD_CONFIG"; then
+      echo "[INFO] User '$username' is already in AllowUsers."
+    else
+      sed -i "s/^[[:space:]]*AllowUsers.*/& $username/" "$SSHD_CONFIG"
+      echo "[OK] Updated AllowUsers line with user '$username'."
+    fi
+  else
+    echo "AllowUsers $username" >> "$SSHD_CONFIG"
+    echo "[OK] Added new AllowUsers line with user '$username'."
+  fi
+
+  if check_sshd_config; then
+    restart_sshd
+  else
+    echo "[ERROR] Config test failed, please revert from backup if needed." >&2
+  fi
+}
+
+root_login_menu() {
+  echo "--- Root SSH Login Configuration ---"
+
+  local current
+  current=$(get_conf_value "PermitRootLogin" "prohibit-password")
+  echo "Current PermitRootLogin: $current"
+  echo
+  echo "Choose how root should be allowed to SSH:"
+  echo "  1) Allow root login WITH password        (PermitRootLogin yes)"
+  echo "  2) Allow root login WITH KEY ONLY        (PermitRootLogin prohibit-password)"
+  echo "  3) Completely DISABLE root SSH login     (PermitRootLogin no)"
+  read -rp "Select option (1-3): " mode
+
+  local new_value
+  case "$mode" in
+    1)
+      new_value="yes"
+      ;;
+    2)
+      new_value="prohibit-password"
+      ;;
+    3)
+      new_value="no"
+      ;;
+    *)
+      echo "[WARN] Invalid choice, cancelled."
+      return 1
+      ;;
+  esac
+
+  backup_config
+
+  if grep -qE '^[[:space:]]*PermitRootLogin' "$SSHD_CONFIG"; then
+    sed -i "s/^[[:space:]]*PermitRootLogin.*/PermitRootLogin $new_value/" "$SSHD_CONFIG"
+  else
+    echo "PermitRootLogin $new_value" >> "$SSHD_CONFIG"
+  fi
+
+  echo "[INFO] PermitRootLogin updated to: $new_value"
+
+  if check_sshd_config; then
+    restart_sshd
+  else
+    echo "[ERROR] Config test failed. Please restore from backup if needed." >&2
+  fi
+}
+
+harden_sshd_menu() {
+  echo "--- SSH Hardening / Configuration Update ---"
+
+  read -rp "Enter SSH port (default 22): " port
+  port=${port:-22}
+
+  if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    echo "[ERROR] Invalid port number. (Allowed: 1-65535)."
+    return 1
+  fi
+
+  echo
+  echo "PasswordAuthentication setting for NON-root users:"
+  echo "  y = yes  (password login allowed, root still key-only)"
+  echo "  n = no   (no passwords at all, only SSH keys)"
+  read -rp "Keep PasswordAuthentication yes? (y/N): " pw_ans
+  pw_ans=${pw_ans:-N}
+
+  # Accept: y, Y, yes, Yes, YES
+  local password_auth
+  if [[ "$pw_ans" =~ ^[Yy](es)?$ ]]; then
+    password_auth="yes"
+  else
+    password_auth="no"
+  fi
+
+  backup_config
+  write_minimal_config "$port" "$password_auth"
+
+  if check_sshd_config; then
+    restart_sshd
+  else
+    echo "[ERROR] New config test failed, please revert from backup." >&2
+  fi
+}
+
+main_menu() {
+  require_root
+
+  while true; do
+    echo
+    echo "================ Secure SSHD Menu ================="
+    echo "1) Show SSH config summary (who can SSH, root status, etc.)"
+    echo "2) Harden/update SSH configuration"
+    echo "3) Create new user and add to AllowUsers"
+    echo "4) Show sshd service status"
+    echo "5) Restart sshd service"
+    echo "6) Configure ROOT SSH login (password / key-only / disabled)"
+    echo "7) Exit"
+    echo "==================================================="
+    read -rp "Choose an option (1-7): " choice
+
+    case "$choice" in
+      1)
+        show_config_summary
+        ;;
+      2)
+        harden_sshd_menu
+        ;;
+      3)
+        add_user_and_allow
+        ;;
+      4)
+        status_sshd_service
+        ;;
+      5)
+        restart_sshd
+        ;;
+      6)
+        root_login_menu
+        ;;
+      7)
+        echo "Goodbye!"
+        exit 0
+        ;;
+      *)
+        echo "[WARN] Invalid option, please try again."
+        ;;
+    esac
+  done
+}
+
+main_menu
