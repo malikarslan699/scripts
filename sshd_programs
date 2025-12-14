@@ -1,0 +1,56 @@
+add_user_full_root() {
+  read -rp "Enter NEW username: " username
+
+  if [[ -z "$username" ]]; then
+    echo "[ERROR] Username cannot be empty."
+    return 1
+  fi
+
+  if id "$username" >/dev/null 2>&1; then
+    echo "[ERROR] User '$username' already exists."
+    return 1
+  fi
+
+  read -rsp "Enter password for $username: " password
+  echo
+  read -rsp "Confirm password: " password2
+  echo
+
+  if [[ "$password" != "$password2" ]]; then
+    echo "[ERROR] Passwords do not match."
+    return 1
+  fi
+
+  echo "[INFO] Creating user '$username'..."
+  useradd -m -s /bin/bash "$username"
+
+  echo "$username:$password" | chpasswd
+  echo "[OK] Password set for '$username'."
+
+  # Give FULL sudo/root access
+  if getent group sudo >/dev/null 2>&1; then
+    usermod -aG sudo "$username"
+    echo "[OK] '$username' added to sudo group (FULL ROOT ACCESS)."
+  elif getent group wheel >/dev/null 2>&1; then
+    usermod -aG wheel "$username"
+    echo "[OK] '$username' added to wheel group (FULL ROOT ACCESS)."
+  else
+    echo "[WARN] No sudo/wheel group found. Configure sudoers manually."
+  fi
+
+  # Add to AllowUsers
+  backup_config
+  if grep -qE '^[[:space:]]*AllowUsers\b' "$SSHD_CONFIG"; then
+    sed -i "s/^[[:space:]]*AllowUsers.*/& $username/" "$SSHD_CONFIG"
+  else
+    echo "AllowUsers $username" >> "$SSHD_CONFIG"
+  fi
+
+  echo "[OK] '$username' added to AllowUsers."
+
+  if check_sshd_config; then
+    restart_sshd
+  else
+    echo "[ERROR] SSH config test failed. Please check manually." >&2
+  fi
+}
