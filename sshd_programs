@@ -4,7 +4,7 @@ set -euo pipefail
 SSHD_CONFIG="/etc/ssh/sshd_config"
 BACKUP_DIR="/etc/ssh/sshd_config.backups"
 
-# ---------------- BASIC FUNCTIONS ----------------
+# ---------------- BASICS ----------------
 
 require_root() {
   if [[ "$(id -u)" -ne 0 ]]; then
@@ -18,31 +18,48 @@ backup_config() {
   cp "$SSHD_CONFIG" "$BACKUP_DIR/sshd_config.$(date +%F-%H%M%S)"
 }
 
-restart_ssh() {
+restart_sshd() {
   mkdir -p /run/sshd
   chmod 755 /run/sshd
-  sshd -t || { echo "[ERROR] sshd config invalid"; return 1; }
-  systemctl restart ssh 2>/dev/null || service ssh restart
-  echo "[OK] SSH service restarted"
+  if sshd -t; then
+    systemctl restart ssh 2>/dev/null || service ssh restart
+    echo "[OK] sshd service restarted."
+  else
+    echo "[ERROR] sshd config invalid. Restore from backup." >&2
+  fi
 }
 
 # ---------------- INFO ----------------
 
-show_summary() {
+get_conf_value() {
+  local key="$1"
+  grep -E "^[[:space:]]*$key[[:space:]]+" "$SSHD_CONFIG" | tail -n1 | awk '{print $2}'
+}
+
+show_config_summary() {
   echo "---------- SSHD CONFIG SUMMARY ----------"
-  grep -E '^(Port|PermitRootLogin|PasswordAuthentication|AllowUsers)' "$SSHD_CONFIG" || true
+  echo "Port:                  $(get_conf_value Port || echo 22)"
+  echo "PermitRootLogin:       $(get_conf_value PermitRootLogin || echo default)"
+  echo "PasswordAuthentication:$(get_conf_value PasswordAuthentication || echo default)"
+  echo "PubkeyAuthentication:  $(get_conf_value PubkeyAuthentication || echo default)"
+  echo "AllowUsers:            $(grep -E '^AllowUsers' "$SSHD_CONFIG" | cut -d' ' -f2- || echo ANY)"
   echo "-----------------------------------------"
 }
 
 # ---------------- HARDEN SSH ----------------
 
-apply_hardened_config() {
+write_minimal_config() {
+  local port="$1"
+  local password_auth="$2"
+  local allow_users
+  allow_users="$(grep -E '^AllowUsers' "$SSHD_CONFIG" || true)"
+
   backup_config
   cat > "$SSHD_CONFIG" <<EOF
-Port 22
+Port $port
 Protocol 2
-PermitRootLogin yes
-PasswordAuthentication yes
+PermitRootLogin prohibit-password
+PasswordAuthentication $password_auth
 KbdInteractiveAuthentication no
 UsePAM yes
 LoginGraceTime 30s
@@ -55,94 +72,128 @@ ClientAliveCountMax 2
 PubkeyAuthentication yes
 AuthorizedKeysFile .ssh/authorized_keys
 Subsystem sftp /usr/lib/openssh/sftp-server
+$allow_users
 EOF
 
-  restart_ssh
-  echo "[OK] Hardened SSH configuration applied"
+  restart_sshd
 }
 
-# ---------------- ADD USER WITH FULL ROOT ----------------
+harden_sshd_menu() {
+  read -rp "Enter SSH port (default 22): " port
+  port=${port:-22}
 
-add_user_full_root() {
-  read -rp "Enter NEW username: " username
+  read -rp "Allow PASSWORD login for users? (y/N): " ans
+  ans=${ans:-N}
+  if [[ "$ans" =~ ^[Yy]$ ]]; then
+    write_minimal_config "$port" yes
+  else
+    write_minimal_config "$port" no
+  fi
+}
+
+# ---------------- CREATE OR UPDATE USER (SMART) ----------------
+
+add_or_update_user() {
+  read -rp "Enter username (create OR update): " username
   [[ -z "$username" ]] && echo "[ERROR] Username empty" && return
 
   if id "$username" &>/dev/null; then
-    echo "[ERROR] User already exists"
-    return
+    echo "[INFO] User '$username' exists → UPDATE mode"
+  else
+    echo "[INFO] Creating user '$username'..."
+    useradd -m -s /bin/bash "$username"
   fi
 
-  read -rsp "Enter password: " p1; echo
-  read -rsp "Confirm password: " p2; echo
-  [[ "$p1" != "$p2" ]] && echo "[ERROR] Passwords do not match" && return
-
-  useradd -m -s /bin/bash "$username"
-  echo "$username:$p1" | chpasswd
-
-  if getent group sudo >/dev/null; then
-    usermod -aG sudo "$username"
-  elif getent group wheel >/dev/null; then
-    usermod -aG wheel "$username"
+  # Password
+  read -rp "Set/Update PASSWORD for $username? (y/N): " pw
+  pw=${pw:-N}
+  if [[ "$pw" =~ ^[Yy]$ ]]; then
+    passwd "$username"
   fi
 
+  # Sudo
+  read -rp "Give FULL ROOT (sudo) access? (y/N): " sudo_ans
+  sudo_ans=${sudo_ans:-N}
+  if [[ "$sudo_ans" =~ ^[Yy]$ ]]; then
+    if getent group sudo >/dev/null; then
+      usermod -aG sudo "$username"
+    elif getent group wheel >/dev/null; then
+      usermod -aG wheel "$username"
+    fi
+    echo "[OK] '$username' has sudo/root access."
+  fi
+
+  # SSH public key
+  read -rp "Add/Update SSH PUBLIC KEY for $username? (y/N): " key_ans
+  key_ans=${key_ans:-N}
+  if [[ "$key_ans" =~ ^[Yy]$ ]]; then
+    read -rp "Paste public key: " pubkey
+    sshdir="/home/$username/.ssh"
+    mkdir -p "$sshdir"
+    echo "$pubkey" >> "$sshdir/authorized_keys"
+    chmod 700 "$sshdir"
+    chmod 600 "$sshdir/authorized_keys"
+    chown -R "$username:$username" "$sshdir"
+    echo "[OK] SSH key added."
+  fi
+
+  # AllowUsers
   backup_config
-  if grep -q "^AllowUsers" "$SSHD_CONFIG"; then
-    sed -i "s/^AllowUsers.*/& $username/" "$SSHD_CONFIG"
+  if grep -q '^AllowUsers' "$SSHD_CONFIG"; then
+    grep -q "(^| )$username( |$)" "$SSHD_CONFIG" || \
+      sed -i "s/^AllowUsers.*/& $username/" "$SSHD_CONFIG"
   else
     echo "AllowUsers $username" >> "$SSHD_CONFIG"
   fi
 
-  restart_ssh
-  echo "[OK] User '$username' created with FULL ROOT (sudo) access"
+  restart_sshd
 }
 
-# ---------------- ROOT SSH CONTROL ----------------
+# ---------------- ROOT SSH ----------------
 
 root_login_menu() {
-  echo "1) Enable ROOT SSH login"
-  echo "2) Disable ROOT SSH login"
-  read -rp "Choose option: " c
+  echo "1) Allow ROOT login (password)"
+  echo "2) Allow ROOT login (key only)"
+  echo "3) Disable ROOT login"
+  read -rp "Choose: " r
 
   backup_config
-  case "$c" in
+  case "$r" in
     1) sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' "$SSHD_CONFIG" ;;
-    2) sed -i 's/^PermitRootLogin.*/PermitRootLogin no/' "$SSHD_CONFIG" ;;
-    *) echo "Invalid option"; return ;;
+    2) sed -i 's/^PermitRootLogin.*/PermitRootLogin prohibit-password/' "$SSHD_CONFIG" ;;
+    3) sed -i 's/^PermitRootLogin.*/PermitRootLogin no/' "$SSHD_CONFIG" ;;
+    *) echo "Invalid" ; return ;;
   esac
 
-  restart_ssh
+  restart_sshd
 }
 
-# ---------------- MAIN MENU ----------------
+# ---------------- MENU ----------------
 
 main_menu() {
   require_root
-
   while true; do
     echo
-    echo "=========== SSHD CONTROL PANEL ==========="
+    echo "================ Secure SSHD Menu ================="
     echo "1) Show SSH config summary"
-    echo "2) Apply hardened SSH configuration"
-    echo "3) Create NEW user with FULL ROOT access"
-    echo "4) Show SSH service status"
-    echo "5) Restart SSH service"
-    echo "6) Configure ROOT SSH login"
-    echo "7) Exit"
-    echo "=========================================="
-    read -rp "Choose option (1-7): " opt
+    echo "2) Harden/update SSH configuration"
+    echo "3) Create OR UPDATE user (password / sudo / SSH key)"
+    echo "4) Restart sshd service"
+    echo "5) Configure ROOT SSH login"
+    echo "6) Exit"
+    echo "==================================================="
+    read -rp "Choose option (1-6): " c
 
-    case "$opt" in
-      1) show_summary ;;
-      2) apply_hardened_config ;;
-      3) add_user_full_root ;;
-      4) systemctl status ssh || service ssh status ;;
-      5) restart_ssh ;;
-      6) root_login_menu ;;
-      7) echo "Goodbye"; exit 0 ;;
+    case "$c" in
+      1) show_config_summary ;;
+      2) harden_sshd_menu ;;
+      3) add_or_update_user ;;
+      4) restart_sshd ;;
+      5) root_login_menu ;;
+      6) exit 0 ;;
       *) echo "[WARN] Invalid option" ;;
     esac
   done
 }
 
-# ---------------- START PROGRAM ----------------
 main_menu
