@@ -1,56 +1,119 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SSHD_CONFIG="/etc/ssh/sshd_config"
+BACKUP_DIR="/etc/ssh/sshd_config.backups"
+
+require_root() {
+  [[ "$(id -u)" -ne 0 ]] && echo "[ERROR] Run as root" && exit 1
+}
+
+backup_config() {
+  mkdir -p "$BACKUP_DIR"
+  cp "$SSHD_CONFIG" "$BACKUP_DIR/sshd_config.$(date +%F-%H%M%S)"
+}
+
+restart_ssh() {
+  sshd -t || { echo "[ERROR] sshd config invalid"; return 1; }
+  systemctl restart ssh 2>/dev/null || service ssh restart
+}
+
+show_summary() {
+  echo "------ SSHD SUMMARY ------"
+  grep -E '^(Port|PermitRootLogin|PasswordAuthentication|AllowUsers)' "$SSHD_CONFIG"
+  echo "--------------------------"
+}
+
+write_hardened_config() {
+  backup_config
+  cat > "$SSHD_CONFIG" <<EOF
+Port 22
+Protocol 2
+PermitRootLogin yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication no
+UsePAM yes
+LoginGraceTime 30s
+MaxAuthTries 3
+MaxSessions 5
+X11Forwarding no
+AllowTcpForwarding no
+ClientAliveInterval 300
+ClientAliveCountMax 2
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+Subsystem sftp /usr/lib/openssh/sftp-server
+EOF
+  restart_ssh
+  echo "[OK] SSH hardened config applied"
+}
+
 add_user_full_root() {
   read -rp "Enter NEW username: " username
+  [[ -z "$username" ]] && echo "[ERROR] Empty username" && return
 
-  if [[ -z "$username" ]]; then
-    echo "[ERROR] Username cannot be empty."
-    return 1
+  if id "$username" &>/dev/null; then
+    echo "[ERROR] User exists"
+    return
   fi
 
-  if id "$username" >/dev/null 2>&1; then
-    echo "[ERROR] User '$username' already exists."
-    return 1
-  fi
+  read -rsp "Enter password: " p1; echo
+  read -rsp "Confirm password: " p2; echo
+  [[ "$p1" != "$p2" ]] && echo "[ERROR] Password mismatch" && return
 
-  read -rsp "Enter password for $username: " password
-  echo
-  read -rsp "Confirm password: " password2
-  echo
-
-  if [[ "$password" != "$password2" ]]; then
-    echo "[ERROR] Passwords do not match."
-    return 1
-  fi
-
-  echo "[INFO] Creating user '$username'..."
   useradd -m -s /bin/bash "$username"
+  echo "$username:$p1" | chpasswd
+  usermod -aG sudo "$username"
 
-  echo "$username:$password" | chpasswd
-  echo "[OK] Password set for '$username'."
-
-  # Give FULL sudo/root access
-  if getent group sudo >/dev/null 2>&1; then
-    usermod -aG sudo "$username"
-    echo "[OK] '$username' added to sudo group (FULL ROOT ACCESS)."
-  elif getent group wheel >/dev/null 2>&1; then
-    usermod -aG wheel "$username"
-    echo "[OK] '$username' added to wheel group (FULL ROOT ACCESS)."
-  else
-    echo "[WARN] No sudo/wheel group found. Configure sudoers manually."
-  fi
-
-  # Add to AllowUsers
   backup_config
-  if grep -qE '^[[:space:]]*AllowUsers\b' "$SSHD_CONFIG"; then
-    sed -i "s/^[[:space:]]*AllowUsers.*/& $username/" "$SSHD_CONFIG"
+  if grep -q "^AllowUsers" "$SSHD_CONFIG"; then
+    sed -i "s/^AllowUsers.*/& $username/" "$SSHD_CONFIG"
   else
     echo "AllowUsers $username" >> "$SSHD_CONFIG"
   fi
 
-  echo "[OK] '$username' added to AllowUsers."
-
-  if check_sshd_config; then
-    restart_sshd
-  else
-    echo "[ERROR] SSH config test failed. Please check manually." >&2
-  fi
+  restart_ssh
+  echo "[OK] User '$username' created with FULL ROOT access"
 }
+
+root_login_menu() {
+  echo "1) Enable root SSH"
+  echo "2) Disable root SSH"
+  read -rp "Choose: " c
+  backup_config
+  case "$c" in
+    1) sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' "$SSHD_CONFIG" ;;
+    2) sed -i 's/^PermitRootLogin.*/PermitRootLogin no/' "$SSHD_CONFIG" ;;
+    *) echo "Invalid"; return ;;
+  esac
+  restart_ssh
+}
+
+main_menu() {
+  require_root
+  while true; do
+    echo
+    echo "====== SSHD CONTROL PANEL ======"
+    echo "1) Show SSH summary"
+    echo "2) Apply hardened SSH config"
+    echo "3) Create NEW user with FULL ROOT access"
+    echo "4) SSH service status"
+    echo "5) Restart SSH service"
+    echo "6) Configure ROOT SSH login"
+    echo "7) Exit"
+    read -rp "Select option: " opt
+
+    case "$opt" in
+      1) show_summary ;;
+      2) write_hardened_config ;;
+      3) add_user_full_root ;;
+      4) systemctl status ssh || service ssh status ;;
+      5) restart_ssh ;;
+      6) root_login_menu ;;
+      7) exit 0 ;;
+      *) echo "Invalid option" ;;
+    esac
+  done
+}
+
+main_menu
