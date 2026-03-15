@@ -83,6 +83,9 @@ One-command (GitHub raw):
     curl -fsSL https://raw.githubusercontent.com/malikarslan699/scripts/main/server_perf_tester.sh | sudo bash -s --
   Quick mode compare:
     curl -fsSL https://raw.githubusercontent.com/malikarslan699/scripts/main/server_perf_tester.sh | sudo bash -s -- --quick
+
+Safety:
+  Existing baseline file is preserved with a timestamped backup before rewrite.
 USAGE
 }
 
@@ -129,6 +132,23 @@ json_escape() {
 
 trim() {
   printf "%s" "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+timestamp_id() {
+  date +%Y%m%d-%H%M%S-%N
+}
+
+backup_existing_file() {
+  local target="$1"
+  local backup
+
+  if [[ ! -e "$target" ]]; then
+    return 0
+  fi
+
+  backup="${target}.backup.$(timestamp_id)"
+  mv "$target" "$backup"
+  log WARN "Preserved existing file by backup: ${target} -> ${backup}"
 }
 
 parse_args() {
@@ -460,6 +480,7 @@ save_baseline() {
   cpu_model_json=$(json_escape "$CPU_MODEL")
 
   mkdir -p "$(dirname "$BASELINE_FILE")"
+  backup_existing_file "$BASELINE_FILE"
   cat >"$BASELINE_FILE" <<JSON
 {
   "label": "${LABEL}",

@@ -107,6 +107,7 @@ Options:
 Notes:
   - In non-interactive mode, password must be provided by --rdp-password or RDP_PASSWORD env var.
   - Default profile is safe for servers: XRDP + XFCE + swap + UFW + fail2ban.
+  - Existing files are preserved via backup paths (non-destructive mode).
   - One-command from GitHub:
     curl -fsSL https://raw.githubusercontent.com/malikarslan699/scripts/main/xrdp_setup_script.sh | sudo bash -s -- --profile core-security
 USAGE
@@ -240,6 +241,35 @@ seconds_to_human() {
   local m=$(((total % 3600) / 60))
   local s=$((total % 60))
   printf "%02dh %02dm %02ds" "$h" "$m" "$s"
+}
+
+timestamp_id() {
+  date +%Y%m%d-%H%M%S-%N
+}
+
+backup_existing_path() {
+  local target="$1"
+  local backup
+
+  if [[ ! -e "$target" ]]; then
+    return 0
+  fi
+
+  backup="${target}.backup.$(timestamp_id)"
+  if $DRY_RUN; then
+    log INFO "[dry-run] Would preserve existing path: ${target} -> ${backup}"
+    return 0
+  fi
+
+  mv "$target" "$backup"
+  log WARN "Preserved existing path by backup: ${target} -> ${backup}"
+}
+
+backup_existing_file() {
+  local target="$1"
+  if [[ -e "$target" ]]; then
+    backup_existing_path "$target"
+  fi
 }
 
 setup_logging() {
@@ -575,9 +605,6 @@ resolve_apt_locks() {
     sleep 2
     pkill -KILL -x apt-get >/dev/null 2>&1 || true
     pkill -KILL -x dpkg >/dev/null 2>&1 || true
-
-    rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
-      /var/lib/apt/lists/lock /var/cache/apt/archives/lock || true
 
     dpkg --configure -a >>"$LOG_FILE" 2>&1 || true
     env DEBIAN_FRONTEND=noninteractive apt-get -f install -y >>"$LOG_FILE" 2>&1 || true
@@ -1069,6 +1096,7 @@ apply_xfce_user_config() {
   if ! $DRY_RUN; then
     mkdir -p "$home_dir/.config/xfce4/xfconf/xfce-perchannel-xml"
 
+    backup_existing_file "$home_dir/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml"
     cat >"$home_dir/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" <<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <channel name="xfwm4" version="1.0">
@@ -1079,16 +1107,18 @@ apply_xfce_user_config() {
 </channel>
 XML
 
+    backup_existing_file "$home_dir/.xsession"
     printf 'xfce4-session\n' >"$home_dir/.xsession"
     chmod 644 "$home_dir/.xsession"
 
-    # If panel file has no plugins defined, reset it so XFCE can recreate defaults.
+    # If panel file has no plugins defined, preserve it and let XFCE recreate defaults.
     local panel_xml="$home_dir/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
     if [[ -f "$panel_xml" ]] && ! grep -q 'plugin-' "$panel_xml"; then
-      rm -f "$panel_xml"
+      backup_existing_file "$panel_xml"
     fi
 
     mkdir -p "$home_dir/.config/autostart"
+    backup_existing_file "$home_dir/.config/autostart/terminal.desktop"
     cat >"$home_dir/.config/autostart/terminal.desktop" <<'DESKTOP'
 [Desktop Entry]
 Type=Application
@@ -1213,6 +1243,9 @@ phase_1_system_prep() {
 phase_2_swap_setup() {
   local required_bytes
   local current_swap
+  local needed_bytes
+  local swap_target
+  local mb_count
 
   required_bytes=$(size_to_bytes "$SWAP_SIZE")
   current_swap=$(swapon --show=SIZE --bytes --noheadings 2>/dev/null | awk '{sum+=$1} END{print sum+0}')
@@ -1227,35 +1260,41 @@ phase_2_swap_setup() {
     return 0
   fi
 
-  print_step "Creating swap file (${SWAP_SIZE})"
-  if ! $DRY_RUN; then
-    swapoff /swapfile >/dev/null 2>&1 || true
-    rm -f /swapfile || true
+  needed_bytes=$((required_bytes - current_swap))
+  if ((needed_bytes < 268435456)); then
+    needed_bytes=268435456
+  fi
 
-    if ! fallocate -l "$SWAP_SIZE" /swapfile 2>>"$LOG_FILE"; then
-      local mb_count
-      mb_count=$((required_bytes / 1024 / 1024))
-      dd if=/dev/zero of=/swapfile bs=1M count="$mb_count" status=progress >>"$LOG_FILE" 2>&1
+  mb_count=$(((needed_bytes + 1048575) / 1048576))
+  swap_target="/swapfile.vpsdesktop"
+  if [[ -e "$swap_target" ]]; then
+    swap_target="/swapfile.vpsdesktop.$(date +%s)"
+  fi
+
+  print_step "Creating additional non-destructive swap file (${mb_count}M)"
+  if ! $DRY_RUN; then
+    if ! fallocate -l "${mb_count}M" "$swap_target" 2>>"$LOG_FILE"; then
+      dd if=/dev/zero of="$swap_target" bs=1M count="$mb_count" status=progress >>"$LOG_FILE" 2>&1
     fi
 
-    chmod 600 /swapfile
-    mkswap /swapfile >>"$LOG_FILE" 2>&1
-    swapon /swapfile
+    chmod 600 "$swap_target"
+    mkswap "$swap_target" >>"$LOG_FILE" 2>&1
+    swapon "$swap_target"
 
-    if ! grep -Eq '^/swapfile\s' /etc/fstab; then
-      printf '/swapfile none swap sw 0 0\n' >>/etc/fstab
+    if ! awk -v s="$swap_target" '$1==s {found=1} END{exit(found?0:1)}' /etc/fstab; then
+      printf '%s none swap sw 0 0\n' "$swap_target" >>/etc/fstab
     fi
 
     set_config_kv "/etc/sysctl.d/99-vps-desktop.conf" "vm.swappiness" "10"
     sysctl -w vm.swappiness=10 >>"$LOG_FILE" 2>&1 || true
   else
-    log INFO "[dry-run] Would create and enable /swapfile (${SWAP_SIZE})."
+    log INFO "[dry-run] Would create and enable ${swap_target} (${mb_count}M) without deleting existing swap files."
   fi
 
   swapon --show >>"$LOG_FILE" 2>&1 || true
   free -h >>"$LOG_FILE" 2>&1 || true
-  print_ok "Swap configured (${SWAP_SIZE})"
-  COMP_SWAP="[OK] ${SWAP_SIZE} Swap"
+  print_ok "Swap configured non-destructively (${swap_target})"
+  COMP_SWAP="[OK] ${SWAP_SIZE} Swap (non-destructive)"
 }
 
 phase_3_desktop_xfce() {
@@ -1298,6 +1337,7 @@ phase_4_xrdp_setup() {
   if ! $DRY_RUN; then
     configure_xrdp_ini
 
+    backup_existing_file "/etc/xrdp/startwm.sh"
     cat >/etc/xrdp/startwm.sh <<'SH'
 #!/bin/sh
 unset DBUS_SESSION_BUS_ADDRESS
@@ -1347,16 +1387,18 @@ install_firefox_mozilla_tarball() {
 
   print_step "Installing Mozilla Firefox binary (${os_slug})"
   curl -fsSL "$archive_url" -o "$tmp_archive"
-  rm -rf /opt/firefox
+  backup_existing_path "/opt/firefox"
   tar -xJf "$tmp_archive" -C /opt
   rm -f "$tmp_archive"
 
+  backup_existing_file "/usr/local/bin/firefox"
   cat >/usr/local/bin/firefox <<'SH'
 #!/usr/bin/env bash
 exec /opt/firefox/firefox "$@"
 SH
   chmod +x /usr/local/bin/firefox
 
+  backup_existing_file "/usr/share/applications/firefox-local.desktop"
   cat >/usr/share/applications/firefox-local.desktop <<'DESKTOP'
 [Desktop Entry]
 Version=1.0
@@ -1375,6 +1417,7 @@ DESKTOP
   user_home=$(user_home_dir "$user")
   if [[ -n "$user_home" ]]; then
     mkdir -p "$user_home/Desktop"
+    backup_existing_file "$user_home/Desktop/firefox.desktop"
     cat >"$user_home/Desktop/firefox.desktop" <<'DESKTOP'
 [Desktop Entry]
 Version=1.0
@@ -1530,6 +1573,7 @@ phase_6_firewall_security() {
   print_step "Applying basic fail2ban protection"
   if ! $DRY_RUN; then
     mkdir -p /etc/fail2ban/jail.d
+    backup_existing_file "/etc/fail2ban/jail.d/vps-desktop.local"
     {
       echo "[sshd]"
       echo "enabled = true"
@@ -1587,6 +1631,7 @@ phase_7_system_optimization() {
     if [[ -n "$user_home" ]]; then
       mkdir -p "$user_home/Desktop"
       chown "$RDP_USER:$RDP_USER" "$user_home/Desktop"
+      backup_existing_file "$user_home/Desktop/HOW_TO_CONNECT.txt"
       cat >"$user_home/Desktop/HOW_TO_CONNECT.txt" <<TXT
 VPS Remote Desktop Connection Guide
 ===================================
