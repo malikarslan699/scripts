@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 DEFAULT_BASELINE_FILE="/opt/server-perf-baseline.json"
-WORK_DIR="/tmp/server-perf"
+WORK_DIR="/tmp/server-perf-$$"
 PING_TARGET="1.1.1.1"
 DOWNLOAD_URL="https://proof.ovh.net/files/100Mb.dat"
 FIO_SIZE="512M"
@@ -13,6 +13,7 @@ INSTALL_DEPS=true
 SET_BASELINE=false
 BASELINE_FILE="$DEFAULT_BASELINE_FILE"
 BASELINE_SCORE=""
+BASELINE_ADJUST_PCT=30
 LABEL="$(hostname)"
 
 SEQ_WRITE_MBPS=0
@@ -29,8 +30,22 @@ DOWNLOAD_SCORE=0
 PING_SCORE=0
 JITTER_SCORE=0
 COMPOSITE_SCORE=0
-IMPROVEMENT_PCT=0
-CATEGORY="Good"
+RAW_IMPROVEMENT_PCT=0
+EFFECTIVE_BASELINE_SCORE=""
+EFFECTIVE_IMPROVEMENT_PCT=0
+CATEGORY="As Good"
+
+CPU_MODEL="Unknown"
+CPU_CORES=0
+CPU_THREADS=0
+CPU_CUR_GHZ=0
+CPU_MAX_GHZ=0
+RAM_TOTAL_GB=0
+RAM_USED_GB=0
+RAM_FREE_GB=0
+STORAGE_TOTAL_GB=0
+STORAGE_USED_GB=0
+STORAGE_FREE_GB=0
 
 RED='\033[31m'
 GREEN='\033[32m'
@@ -47,6 +62,7 @@ Options:
   --set-baseline                 Save current server score as baseline JSON.
   --baseline-file <path>         Baseline file path (default: ${DEFAULT_BASELINE_FILE}).
   --baseline-score <score>       Compare against explicit baseline score.
+  --baseline-adjust-pct <n>      Reduce baseline by n% for category logic (default: ${BASELINE_ADJUST_PCT}).
   --no-install-deps              Skip auto-install of benchmark dependencies.
   --quick                        Faster test mode (smaller/shorter fio).
   --label <name>                 Friendly name for this server in output.
@@ -54,11 +70,19 @@ Options:
   --ping-target <host>           Ping target for latency/jitter test.
   --help                         Show help.
 
-Category logic vs baseline:
-  Good: < 50% better than baseline
+Category logic vs effective baseline:
+  As Good: < 50% better
   Very Good: >= 50% better
   Excellent: around 100% better (95% to 100%)
   Pro Level: > 100% better
+
+One-command (GitHub raw):
+  Set baseline:
+    curl -fsSL https://raw.githubusercontent.com/malikarslan699/scripts/main/server_perf_tester.sh | sudo bash -s -- --set-baseline
+  Compare with saved baseline:
+    curl -fsSL https://raw.githubusercontent.com/malikarslan699/scripts/main/server_perf_tester.sh | sudo bash -s --
+  Quick mode compare:
+    curl -fsSL https://raw.githubusercontent.com/malikarslan699/scripts/main/server_perf_tester.sh | sudo bash -s -- --quick
 USAGE
 }
 
@@ -94,6 +118,19 @@ cap100() {
   awk -v v="$value" -v c="$cap" 'BEGIN {s=(c>0? (v/c)*100 : 0); if (s<0) s=0; if (s>100) s=100; printf "%.2f", s}'
 }
 
+bytes_to_gb() {
+  local bytes="$1"
+  awk -v b="$bytes" 'BEGIN {printf "%.2f", b/1073741824}'
+}
+
+json_escape() {
+  printf "%s" "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+trim() {
+  printf "%s" "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
 parse_args() {
   while (($# > 0)); do
     case "$1" in
@@ -108,6 +145,11 @@ parse_args() {
       --baseline-score)
         [[ $# -ge 2 ]] || { echo "Missing value for --baseline-score"; exit 1; }
         BASELINE_SCORE="$2"
+        shift
+        ;;
+      --baseline-adjust-pct)
+        [[ $# -ge 2 ]] || { echo "Missing value for --baseline-adjust-pct"; exit 1; }
+        BASELINE_ADJUST_PCT="$2"
         shift
         ;;
       --no-install-deps)
@@ -144,6 +186,11 @@ parse_args() {
     esac
     shift
   done
+
+  if ! [[ "$BASELINE_ADJUST_PCT" =~ ^[0-9]+$ ]] || ((BASELINE_ADJUST_PCT >= 100)); then
+    echo "Invalid --baseline-adjust-pct '${BASELINE_ADJUST_PCT}'. Use an integer from 0 to 99."
+    exit 1
+  fi
 }
 
 install_dependencies() {
@@ -165,7 +212,7 @@ install_dependencies() {
 require_cmds() {
   local missing=0
   local c
-  for c in fio curl jq bc ping awk sed grep; do
+  for c in fio curl jq bc ping awk sed grep df free lscpu nproc; do
     if ! command -v "$c" >/dev/null 2>&1; then
       log ERROR "Missing command: $c"
       missing=1
@@ -253,6 +300,93 @@ measure_network() {
   PING_JITTER_MS=$(num_or_zero "$PING_JITTER_MS")
 }
 
+measure_system_snapshot() {
+  local cpu_model
+  local cpu_cores
+  local cur_mhz
+  local max_mhz
+  local ghz_hint
+  local mem_total_b
+  local mem_used_b
+  local mem_free_b
+  local disk_total_b
+  local disk_used_b
+  local disk_free_b
+
+  cpu_model=$(lscpu | awk -F: '/^Model name:/ {print $2; exit}')
+  if [[ -z "$cpu_model" ]]; then
+    cpu_model=$(awk -F: '/^model name|^Hardware|^Processor/ {print $2; exit}' /proc/cpuinfo 2>/dev/null || true)
+  fi
+  CPU_MODEL=$(trim "${cpu_model:-Unknown}")
+
+  cpu_cores=$(lscpu | awk -F: '
+    /^Core\(s\) per socket:/ {cores=$2}
+    /^Socket\(s\):/ {sockets=$2}
+    END {
+      gsub(/^[ \t]+|[ \t]+$/, "", cores)
+      gsub(/^[ \t]+|[ \t]+$/, "", sockets)
+      if (cores ~ /^[0-9]+$/ && sockets ~ /^[0-9]+$/) {
+        print cores * sockets
+      }
+    }')
+  if [[ -z "$cpu_cores" ]]; then
+    cpu_cores=$(lscpu | awk -F: '/^Core\(s\) per socket:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
+  fi
+  if [[ -z "$cpu_cores" ]]; then
+    cpu_cores=$(nproc --all 2>/dev/null || echo 0)
+  fi
+  CPU_CORES=$(num_or_zero "$cpu_cores")
+  CPU_THREADS=$(num_or_zero "$(nproc --all 2>/dev/null || echo 0)")
+
+  cur_mhz=$(awk -F: '/^cpu MHz/ {sum+=$2; n++} END {if (n>0) printf "%.2f", sum/n; else print "0"}' /proc/cpuinfo 2>/dev/null || echo 0)
+  max_mhz=$(lscpu | awk -F: '/^CPU max MHz:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
+  if [[ -z "$max_mhz" ]]; then
+    max_mhz=$(awk -F: '/^cpu MHz/ {if ($2>max) max=$2} END {if (max>0) printf "%.2f", max; else print "0"}' /proc/cpuinfo 2>/dev/null || echo 0)
+  fi
+  cur_mhz=$(num_or_zero "$(trim "$cur_mhz")")
+  max_mhz=$(num_or_zero "$(trim "$max_mhz")")
+
+  ghz_hint=$(lscpu | awk -F'@' '
+    /@[[:space:]]*[0-9.]+GHz/ {
+      if (match($2, /([0-9.]+)[[:space:]]*GHz/, m)) {
+        print m[1]
+        exit
+      }
+    }')
+  ghz_hint=$(num_or_zero "$(trim "${ghz_hint:-0}")")
+
+  CPU_CUR_GHZ=$(calc "$cur_mhz / 1000")
+  CPU_MAX_GHZ=$(calc "$max_mhz / 1000")
+  if awk -v v="$CPU_CUR_GHZ" 'BEGIN {exit !(v <= 0)}'; then
+    CPU_CUR_GHZ=$(calc "$ghz_hint")
+  fi
+  if awk -v v="$CPU_MAX_GHZ" 'BEGIN {exit !(v <= 0)}'; then
+    CPU_MAX_GHZ=$(calc "$ghz_hint")
+  fi
+
+  mem_total_b=$(free -b | awk '/^Mem:/ {print $2}')
+  mem_used_b=$(free -b | awk '/^Mem:/ {print $3}')
+  mem_free_b=$(free -b | awk '/^Mem:/ {print $4}')
+  mem_total_b=$(num_or_zero "$mem_total_b")
+  mem_used_b=$(num_or_zero "$mem_used_b")
+  mem_free_b=$(num_or_zero "$mem_free_b")
+
+  RAM_TOTAL_GB=$(bytes_to_gb "$mem_total_b")
+  RAM_USED_GB=$(bytes_to_gb "$mem_used_b")
+  RAM_FREE_GB=$(bytes_to_gb "$mem_free_b")
+
+  disk_total_b=$(df -B1 / | awk 'NR==2 {print $2}')
+  disk_used_b=$(df -B1 / | awk 'NR==2 {print $3}')
+  disk_free_b=$(df -B1 / | awk 'NR==2 {print $4}')
+  disk_total_b=$(num_or_zero "$disk_total_b")
+  disk_used_b=$(num_or_zero "$disk_used_b")
+  disk_free_b=$(num_or_zero "$disk_free_b")
+
+  STORAGE_TOTAL_GB=$(bytes_to_gb "$disk_total_b")
+  STORAGE_USED_GB=$(bytes_to_gb "$disk_used_b")
+  STORAGE_FREE_GB=$(bytes_to_gb "$disk_free_b")
+}
+
 score_results() {
   # Caps tuned for VPS class machines.
   DISK_WRITE_SCORE=$(cap100 "$SEQ_WRITE_MBPS" 300)
@@ -292,32 +426,66 @@ classify() {
   load_baseline_score
 
   if [[ -z "$BASELINE_SCORE" || "$BASELINE_SCORE" == "0" ]]; then
-    CATEGORY="Good"
-    IMPROVEMENT_PCT=0
+    CATEGORY="As Good"
+    EFFECTIVE_BASELINE_SCORE=""
+    RAW_IMPROVEMENT_PCT=0
+    EFFECTIVE_IMPROVEMENT_PCT=0
     return
   fi
 
-  IMPROVEMENT_PCT=$(awk -v c="$COMPOSITE_SCORE" -v b="$BASELINE_SCORE" 'BEGIN {printf "%.2f", ((c-b)/b)*100}')
+  RAW_IMPROVEMENT_PCT=$(awk -v c="$COMPOSITE_SCORE" -v b="$BASELINE_SCORE" 'BEGIN {printf "%.2f", ((c-b)/b)*100}')
+  EFFECTIVE_BASELINE_SCORE=$(awk -v b="$BASELINE_SCORE" -v p="$BASELINE_ADJUST_PCT" \
+    'BEGIN {printf "%.2f", b * (1 - (p / 100))}')
 
-  if awk -v v="$IMPROVEMENT_PCT" 'BEGIN {exit !(v > 100)}'; then
+  if awk -v b="$EFFECTIVE_BASELINE_SCORE" 'BEGIN {exit !(b <= 0)}'; then
+    EFFECTIVE_BASELINE_SCORE="$BASELINE_SCORE"
+  fi
+
+  EFFECTIVE_IMPROVEMENT_PCT=$(awk -v c="$COMPOSITE_SCORE" -v b="$EFFECTIVE_BASELINE_SCORE" \
+    'BEGIN {printf "%.2f", ((c-b)/b)*100}')
+
+  if awk -v v="$EFFECTIVE_IMPROVEMENT_PCT" 'BEGIN {exit !(v > 100)}'; then
     CATEGORY="Pro Level"
-  elif awk -v v="$IMPROVEMENT_PCT" 'BEGIN {exit !(v >= 95)}'; then
+  elif awk -v v="$EFFECTIVE_IMPROVEMENT_PCT" 'BEGIN {exit !(v >= 95)}'; then
     CATEGORY="Excellent"
-  elif awk -v v="$IMPROVEMENT_PCT" 'BEGIN {exit !(v >= 50)}'; then
+  elif awk -v v="$EFFECTIVE_IMPROVEMENT_PCT" 'BEGIN {exit !(v >= 50)}'; then
     CATEGORY="Very Good"
   else
-    CATEGORY="Good"
+    CATEGORY="As Good"
   fi
 }
 
 save_baseline() {
+  local cpu_model_json
+  cpu_model_json=$(json_escape "$CPU_MODEL")
+
   mkdir -p "$(dirname "$BASELINE_FILE")"
   cat >"$BASELINE_FILE" <<JSON
 {
   "label": "${LABEL}",
   "hostname": "$(hostname)",
   "timestamp": "$(date -Iseconds)",
+  "baseline_adjust_pct_default": ${BASELINE_ADJUST_PCT},
   "composite_score": ${COMPOSITE_SCORE},
+  "hardware": {
+    "cpu": {
+      "model": "${cpu_model_json}",
+      "cores": ${CPU_CORES},
+      "threads": ${CPU_THREADS},
+      "current_ghz": ${CPU_CUR_GHZ},
+      "max_ghz": ${CPU_MAX_GHZ}
+    },
+    "ram_gb": {
+      "total": ${RAM_TOTAL_GB},
+      "used": ${RAM_USED_GB},
+      "free": ${RAM_FREE_GB}
+    },
+    "storage_root_gb": {
+      "total": ${STORAGE_TOTAL_GB},
+      "used": ${STORAGE_USED_GB},
+      "free": ${STORAGE_FREE_GB}
+    }
+  },
   "metrics": {
     "seq_write_mbps": ${SEQ_WRITE_MBPS},
     "seq_read_mbps": ${SEQ_READ_MBPS},
@@ -337,6 +505,15 @@ print_report() {
   printf "%bHost:%b %s\n" "$BOLD" "$RESET" "$(hostname)"
   printf "%bDate:%b %s\n\n" "$BOLD" "$RESET" "$(date '+%Y-%m-%d %H:%M:%S')"
 
+  printf "%-26s %12s\n" "System Snapshot" ""
+  printf "%-26s %12s\n" "--------------------------" "------------"
+  printf "%-26s %12s\n" "CPU model" "$CPU_MODEL"
+  printf "%-26s %12s\n" "CPU cores / threads" "${CPU_CORES}/${CPU_THREADS}"
+  printf "%-26s %12s\n" "CPU GHz (cur/max)" "${CPU_CUR_GHZ}/${CPU_MAX_GHZ}"
+  printf "%-26s %12s\n" "RAM GB (total/used/free)" "${RAM_TOTAL_GB}/${RAM_USED_GB}/${RAM_FREE_GB}"
+  printf "%-26s %12s\n" "Disk GB / (tot/used/free)" "${STORAGE_TOTAL_GB}/${STORAGE_USED_GB}/${STORAGE_FREE_GB}"
+  printf "\n"
+
   printf "%-26s %12s\n" "Metric" "Value"
   printf "%-26s %12s\n" "--------------------------" "------------"
   printf "%-26s %12s\n" "Seq write (MB/s)" "$SEQ_WRITE_MBPS"
@@ -348,17 +525,24 @@ print_report() {
   printf "\n%-26s %12s\n" "Composite score" "$COMPOSITE_SCORE"
 
   if [[ -n "$BASELINE_SCORE" ]]; then
-    printf "%-26s %12s\n" "Baseline score" "$BASELINE_SCORE"
-    printf "%-26s %12s\n" "Improvement" "${IMPROVEMENT_PCT}%"
+    printf "%-26s %12s\n" "Baseline score (raw)" "$BASELINE_SCORE"
+    printf "%-26s %12s\n" "Baseline score (effective)" "$EFFECTIVE_BASELINE_SCORE"
+    printf "%-26s %12s\n" "Better than base (raw %)" "${RAW_IMPROVEMENT_PCT}%"
+    printf "%-26s %12s\n" "Better than base (effective %)" "${EFFECTIVE_IMPROVEMENT_PCT}%"
+    printf "%-26s %12s\n" "Baseline adjust pct" "${BASELINE_ADJUST_PCT}%"
   else
-    printf "%-26s %12s\n" "Baseline score" "(not set)"
+    printf "%-26s %12s\n" "Baseline score (raw)" "(not set)"
+    printf "%-26s %12s\n" "Baseline score (effective)" "(not set)"
+    printf "%-26s %12s\n" "Better than base (raw %)" "(not set)"
+    printf "%-26s %12s\n" "Better than base (effective %)" "(not set)"
+    printf "%-26s %12s\n" "Baseline adjust pct" "${BASELINE_ADJUST_PCT}%"
   fi
 
   printf "%-26s %12s\n\n" "Category" "$CATEGORY"
 
   cat <<NOTE
 Category meaning:
-- Good: baseline level or less than 50% better
+- As Good: effective baseline level or less than 50% better
 - Very Good: 50% to <95% better
 - Excellent: ~100% better
 - Pro Level: >100% better
@@ -372,12 +556,16 @@ main() {
 
   measure_disk
   measure_network
+  measure_system_snapshot
   score_results
 
   if $SET_BASELINE; then
     BASELINE_SCORE="$COMPOSITE_SCORE"
-    IMPROVEMENT_PCT=0
-    CATEGORY="Good"
+    EFFECTIVE_BASELINE_SCORE=$(awk -v b="$BASELINE_SCORE" -v p="$BASELINE_ADJUST_PCT" \
+      'BEGIN {printf "%.2f", b * (1 - (p / 100))}')
+    RAW_IMPROVEMENT_PCT=0
+    EFFECTIVE_IMPROVEMENT_PCT=0
+    CATEGORY="As Good"
     save_baseline
   else
     classify

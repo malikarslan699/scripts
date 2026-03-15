@@ -41,6 +41,20 @@ REPORT_GENERATED=false
 ERROR_COUNT=0
 PREFLIGHT_HARD_FAIL=false
 PUBLIC_IP="Unavailable"
+FIREFOX_BIN="Unavailable"
+FIREFOX_VERSION="Unavailable"
+
+SYS_CPU_MODEL="Unknown"
+SYS_CPU_CORES=0
+SYS_CPU_THREADS=0
+SYS_CPU_CUR_GHZ=0
+SYS_CPU_MAX_GHZ=0
+SYS_RAM_TOTAL_GB=0
+SYS_RAM_USED_GB=0
+SYS_RAM_FREE_GB=0
+SYS_DISK_TOTAL_GB=0
+SYS_DISK_USED_GB=0
+SYS_DISK_FREE_GB=0
 
 PREFLIGHT_RESULTS=()
 PREFLIGHT_ORDER=()
@@ -93,6 +107,8 @@ Options:
 Notes:
   - In non-interactive mode, password must be provided by --rdp-password or RDP_PASSWORD env var.
   - Default profile is safe for servers: XRDP + XFCE + swap + UFW + fail2ban.
+  - One-command from GitHub:
+    curl -fsSL https://raw.githubusercontent.com/malikarslan699/scripts/main/xrdp_setup_script.sh | sudo bash -s -- --profile core-security
 USAGE
 }
 
@@ -348,6 +364,13 @@ print_preflight_summary() {
   done
 
   printf "%b+----------------------+--------+----------------------------------+%b\n" "$BOLD" "$RESET"
+  printf "\n%bSystem Snapshot%b\n" "$BOLD" "$RESET"
+  printf "  CPU: %s | %s cores / %s threads | %s/%s GHz (cur/max)\n" \
+    "$SYS_CPU_MODEL" "$SYS_CPU_CORES" "$SYS_CPU_THREADS" "$SYS_CPU_CUR_GHZ" "$SYS_CPU_MAX_GHZ"
+  printf "  RAM (GB): total %s | used %s | free %s\n" \
+    "$SYS_RAM_TOTAL_GB" "$SYS_RAM_USED_GB" "$SYS_RAM_FREE_GB"
+  printf "  Storage / (GB): total %s | used %s | free %s\n" \
+    "$SYS_DISK_TOTAL_GB" "$SYS_DISK_USED_GB" "$SYS_DISK_FREE_GB"
 }
 
 ensure_line_in_file() {
@@ -416,6 +439,106 @@ get_public_ip() {
   fi
 
   printf "Unavailable"
+}
+
+num_or_zero() {
+  local v="$1"
+  if [[ "$v" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    printf "%s" "$v"
+  else
+    printf "0"
+  fi
+}
+
+bytes_to_gb() {
+  local bytes="$1"
+  awk -v b="$bytes" 'BEGIN {printf "%.2f", b/1073741824}'
+}
+
+capture_system_snapshot() {
+  local cpu_model
+  local cpu_cores
+  local cpu_threads
+  local cur_mhz
+  local max_mhz
+  local ghz_hint
+  local mem_total_b
+  local mem_used_b
+  local mem_free_b
+  local disk_total_b
+  local disk_used_b
+  local disk_free_b
+
+  cpu_model=$(lscpu | awk -F: '/^Model name:/ {print $2; exit}')
+  if [[ -z "$cpu_model" ]]; then
+    cpu_model=$(awk -F: '/^model name|^Hardware|^Processor/ {print $2; exit}' /proc/cpuinfo 2>/dev/null || true)
+  fi
+  SYS_CPU_MODEL=$(printf "%s" "${cpu_model:-Unknown}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+
+  cpu_cores=$(lscpu | awk -F: '
+    /^Core\(s\) per socket:/ {cores=$2}
+    /^Socket\(s\):/ {sockets=$2}
+    END {
+      gsub(/^[ \t]+|[ \t]+$/, "", cores)
+      gsub(/^[ \t]+|[ \t]+$/, "", sockets)
+      if (cores ~ /^[0-9]+$/ && sockets ~ /^[0-9]+$/) {
+        print cores * sockets
+      }
+    }')
+  if [[ -z "$cpu_cores" ]]; then
+    cpu_cores=$(lscpu | awk -F: '/^Core\(s\) per socket:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
+  fi
+  if [[ -z "$cpu_cores" ]]; then
+    cpu_cores=$(nproc --all 2>/dev/null || echo 0)
+  fi
+  SYS_CPU_CORES=$(num_or_zero "$cpu_cores")
+
+  cpu_threads=$(nproc --all 2>/dev/null || echo 0)
+  SYS_CPU_THREADS=$(num_or_zero "$cpu_threads")
+
+  cur_mhz=$(awk -F: '/^cpu MHz/ {sum+=$2; n++} END {if (n>0) printf "%.2f", sum/n; else print "0"}' /proc/cpuinfo 2>/dev/null || echo 0)
+  max_mhz=$(lscpu | awk -F: '/^CPU max MHz:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit}')
+  if [[ -z "$max_mhz" ]]; then
+    max_mhz=$(awk -F: '/^cpu MHz/ {if ($2>max) max=$2} END {if (max>0) printf "%.2f", max; else print "0"}' /proc/cpuinfo 2>/dev/null || echo 0)
+  fi
+  cur_mhz=$(num_or_zero "$cur_mhz")
+  max_mhz=$(num_or_zero "$max_mhz")
+  ghz_hint=$(lscpu | awk -F'@' '
+    /@[[:space:]]*[0-9.]+GHz/ {
+      if (match($2, /([0-9.]+)[[:space:]]*GHz/, m)) {
+        print m[1]
+        exit
+      }
+    }')
+  ghz_hint=$(num_or_zero "$ghz_hint")
+  SYS_CPU_CUR_GHZ=$(awk -v m="$cur_mhz" 'BEGIN {printf "%.2f", m/1000}')
+  SYS_CPU_MAX_GHZ=$(awk -v m="$max_mhz" 'BEGIN {printf "%.2f", m/1000}')
+  if awk -v v="$SYS_CPU_CUR_GHZ" 'BEGIN {exit !(v <= 0)}'; then
+    SYS_CPU_CUR_GHZ=$(awk -v g="$ghz_hint" 'BEGIN {printf "%.2f", g}')
+  fi
+  if awk -v v="$SYS_CPU_MAX_GHZ" 'BEGIN {exit !(v <= 0)}'; then
+    SYS_CPU_MAX_GHZ=$(awk -v g="$ghz_hint" 'BEGIN {printf "%.2f", g}')
+  fi
+
+  mem_total_b=$(free -b | awk '/^Mem:/ {print $2}')
+  mem_used_b=$(free -b | awk '/^Mem:/ {print $3}')
+  mem_free_b=$(free -b | awk '/^Mem:/ {print $4}')
+  mem_total_b=$(num_or_zero "$mem_total_b")
+  mem_used_b=$(num_or_zero "$mem_used_b")
+  mem_free_b=$(num_or_zero "$mem_free_b")
+  SYS_RAM_TOTAL_GB=$(bytes_to_gb "$mem_total_b")
+  SYS_RAM_USED_GB=$(bytes_to_gb "$mem_used_b")
+  SYS_RAM_FREE_GB=$(bytes_to_gb "$mem_free_b")
+
+  disk_total_b=$(df -B1 / | awk 'NR==2 {print $2}')
+  disk_used_b=$(df -B1 / | awk 'NR==2 {print $3}')
+  disk_free_b=$(df -B1 / | awk 'NR==2 {print $4}')
+  disk_total_b=$(num_or_zero "$disk_total_b")
+  disk_used_b=$(num_or_zero "$disk_used_b")
+  disk_free_b=$(num_or_zero "$disk_free_b")
+  SYS_DISK_TOTAL_GB=$(bytes_to_gb "$disk_total_b")
+  SYS_DISK_USED_GB=$(bytes_to_gb "$disk_used_b")
+  SYS_DISK_FREE_GB=$(bytes_to_gb "$disk_free_b")
 }
 
 resolve_apt_locks() {
@@ -633,6 +756,7 @@ phase_0_preflight_checks() {
   PREFLIGHT_RESULTS=()
   PREFLIGHT_ORDER=()
   PREFLIGHT_HARD_FAIL=false
+  capture_system_snapshot
 
   check_root_access
   check_os_version
@@ -1267,7 +1391,46 @@ DESKTOP
 }
 
 firefox_works() {
-  command -v firefox >/dev/null 2>&1 && firefox --version >/dev/null 2>&1
+  local bin
+  bin=$(resolve_firefox_binary) || return 1
+  "$bin" --version >/dev/null 2>&1
+}
+
+resolve_firefox_binary() {
+  local candidate
+  local cmd_path
+
+  cmd_path=$(command -v firefox 2>/dev/null || true)
+  for candidate in "$cmd_path" /snap/bin/firefox /usr/local/bin/firefox /opt/firefox/firefox; do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      printf "%s" "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+record_firefox_details() {
+  local bin
+  local version
+
+  if ! bin=$(resolve_firefox_binary); then
+    FIREFOX_BIN="Unavailable"
+    FIREFOX_VERSION="Unavailable"
+    return 1
+  fi
+
+  version=$("$bin" --version 2>/dev/null | head -n1 || true)
+  if [[ -z "$version" ]]; then
+    FIREFOX_BIN="$bin"
+    FIREFOX_VERSION="Unknown"
+    return 1
+  fi
+
+  FIREFOX_BIN="$bin"
+  FIREFOX_VERSION="$version"
+  return 0
 }
 
 phase_5_firefox_setup() {
@@ -1278,6 +1441,7 @@ phase_5_firefox_setup() {
   fi
 
   if firefox_works; then
+    record_firefox_details || true
     print_ok "Firefox already installed"
     COMP_FIREFOX="[OK] Firefox (existing)"
     return 0
@@ -1288,12 +1452,21 @@ phase_5_firefox_setup() {
 
   if ! $DRY_RUN; then
     systemctl enable --now snapd.socket >>"$LOG_FILE" 2>&1 || true
-    sleep 3
+    systemctl start snapd.apparmor >>"$LOG_FILE" 2>&1 || true
+    sleep 5
+
+    if command -v snap >/dev/null 2>&1; then
+      snap wait system seed.loaded >>"$LOG_FILE" 2>&1 || true
+      if ! firefox_works; then
+        snap install firefox --stable >>"$LOG_FILE" 2>&1 || true
+      fi
+    fi
   else
     log INFO "[dry-run] Would install Firefox packages and verify startup"
   fi
 
   if $DRY_RUN || firefox_works; then
+    record_firefox_details || true
     print_ok "Firefox installed"
     COMP_FIREFOX="[OK] Firefox"
   else
@@ -1303,6 +1476,7 @@ phase_5_firefox_setup() {
     fi
 
     if $DRY_RUN || firefox_works; then
+      record_firefox_details || true
       print_ok "Firefox installed via Mozilla tarball fallback"
       COMP_FIREFOX="[OK] Firefox (mozilla-fallback)"
     else
@@ -1564,14 +1738,21 @@ phase_10_testing_and_verification() {
 
   if [[ "$INSTALL_FIREFOX" == "true" ]]; then
     print_step "Firefox verification"
-    if command -v firefox >/dev/null 2>&1; then
-      log SUCCESS "Firefox found at $(command -v firefox)"
-      firefox --version >>"$LOG_FILE" 2>&1 || true
-    elif [[ -x /snap/bin/firefox ]]; then
-      log SUCCESS "Firefox found at /snap/bin/firefox"
-      /snap/bin/firefox --version >>"$LOG_FILE" 2>&1 || true
+    if record_firefox_details; then
+      log SUCCESS "Firefox verified at ${FIREFOX_BIN}"
+      printf "%s\n" "${FIREFOX_VERSION}" >>"$LOG_FILE"
     else
-      log WARN "Firefox binary not found"
+      log WARN "Firefox verification failed; attempting Mozilla tarball repair."
+      install_firefox_mozilla_tarball "$RDP_USER" >>"$LOG_FILE" 2>&1 || true
+
+      if record_firefox_details; then
+        log SUCCESS "Firefox repaired at ${FIREFOX_BIN}"
+        printf "%s\n" "${FIREFOX_VERSION}" >>"$LOG_FILE"
+        COMP_FIREFOX="[OK] Firefox (repaired)"
+      else
+        log ERROR "Firefox still unusable after repair attempt."
+        COMP_FIREFOX="[ ] Firefox (verification failed)"
+      fi
     fi
   fi
 
@@ -1601,9 +1782,6 @@ generate_final_report() {
   local end_time
   local elapsed
   local elapsed_human
-  local ram_total
-  local disk_total
-  local disk_remain
   local os_pretty
   local xrdp_version
   local log_errors
@@ -1611,10 +1789,7 @@ generate_final_report() {
   end_time=$(date +%s)
   elapsed=$((end_time - START_TIME))
   elapsed_human=$(seconds_to_human "$elapsed")
-
-  ram_total=$(free -h | awk '/^Mem:/ {print $2}')
-  disk_total=$(df -h / | awk 'NR==2 {print $2}')
-  disk_remain=$(df -h / | awk 'NR==2 {print $4}')
+  capture_system_snapshot
 
   if [[ -f /etc/os-release ]]; then
     # shellcheck disable=SC1091
@@ -1629,6 +1804,7 @@ generate_final_report() {
   fi
 
   xrdp_version=$(xrdp --version 2>/dev/null | head -n1 || echo "Unknown")
+  record_firefox_details || true
   log_errors=$(grep -c "\[ERROR\]" "$LOG_FILE" 2>/dev/null || true)
   log_errors=${log_errors:-$ERROR_COUNT}
 
@@ -1643,8 +1819,11 @@ Total Time: ${elapsed_human}
 SYSTEM INFO:
   OS: ${os_pretty}
   Arch: ${ARCH}
-  RAM: ${ram_total}
-  Disk: ${disk_total} (${disk_remain} remaining)
+  CPU: ${SYS_CPU_MODEL}
+  CPU Cores/Threads: ${SYS_CPU_CORES}/${SYS_CPU_THREADS}
+  CPU GHz (cur/max): ${SYS_CPU_CUR_GHZ}/${SYS_CPU_MAX_GHZ}
+  RAM GB (total/used/free): ${SYS_RAM_TOTAL_GB}/${SYS_RAM_USED_GB}/${SYS_RAM_FREE_GB}
+  Storage / GB (total/used/free): ${SYS_DISK_TOTAL_GB}/${SYS_DISK_USED_GB}/${SYS_DISK_FREE_GB}
   IP: ${PUBLIC_IP}
 
 CONFIG:
@@ -1664,6 +1843,8 @@ INSTALLED COMPONENTS:
   ${COMP_SWAP}
   ${COMP_COCKPIT}
   XRDP Version: ${xrdp_version}
+  Firefox Binary: ${FIREFOX_BIN}
+  Firefox Version: ${FIREFOX_VERSION}
 
 CONNECTION INFO:
   Windows: mstsc -> ${PUBLIC_IP}:${RDP_PORT}
